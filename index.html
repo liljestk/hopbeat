@@ -1,0 +1,1895 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#f6e2c9">
+<title>Hopbeat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{color-scheme:light;background:#f6e2c9}
+  html,body{margin:0;height:100%;background:#f6e2c9;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+  canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// ============================================================
+//  HOPBEAT — tap the pad as the ring closes, on the beat.
+// ============================================================
+const cv = document.getElementById('c');
+const g = cv.getContext('2d');
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+const FONT = 'Fredoka, "Trebuchet MS", sans-serif';
+
+// plasticine palette
+const TEAL = '#2fb0a3', PINK = '#ec5d86', GOLD = '#f6b53a', RED = '#dd3f35', MINT = '#7cc46a', ORANGE = '#f28a3a';
+const DUDE = '#ff8fb1', INK = '#4b322b', CREAM = '#fff6e8';
+
+// Timing windows (seconds)
+const PERFECT_WIN = 0.075, GOOD_WIN = 0.15, EARLY_IGNORE = 0.32;
+const START_BPM = 96, BPM_STEP = 8, MAX_BPM = 188, JUMPS_PER_LEVEL = 16;
+
+// Rhythm patterns (in beats between pads); higher levels unlock more
+const POOLS = [
+  [[1, 1, 1, 1], [1, 1, 2], [2, 1, 1], [1, 1, 1, 1]],
+  [[1, 0.5, 0.5, 1, 1], [1.5, 1.5, 1], [1, 1, 1, 0.5, 0.5]],
+  [[0.5, 0.5, 0.5, 0.5, 1, 1], [2, 0.5, 0.5, 1], [1.5, 0.5, 1, 1]],
+];
+// A minor: Am – F – C – G
+const PROG = [
+  { root: 45, tones: [57, 60, 64] },
+  { root: 41, tones: [57, 60, 65] },
+  { root: 48, tones: [55, 60, 64] },
+  { root: 43, tones: [55, 59, 62] },
+];
+// worlds take turns as you climb: each has its own chord loop and its own clay backdrop
+const WORLDS = [
+  { name: 'MEADOW', prog: PROG, sky: ['#bfe0e3', '#fde3c6', '#6b7db5', '#b7c4e4'],
+    far: '#a8c98c', near: '#78ad68', ground: ['#6c9f5c', '#4e7a44'], sun: '#f7ad3a' },
+  { name: 'SUNSET', sky: ['#f6b98a', '#fde2b8', '#a9577e', '#eea07e'],
+    far: '#e3a46e', near: '#c97b50', ground: ['#b86a40', '#8f4e2f'], sun: '#ff7a45',
+    prog: [ // C major: C – G – Am – F
+      { root: 48, tones: [55, 60, 64] }, { root: 43, tones: [55, 59, 62] },
+      { root: 45, tones: [57, 60, 64] }, { root: 41, tones: [57, 60, 65] }] },
+  { name: 'MOONLIGHT', sky: ['#7d8bcc', '#b4bfec', '#2c3166', '#5d62a4'],
+    far: '#8292d2', near: '#5d6db3', ground: ['#4b5896', '#343f73'], sun: '#f3ecd0',
+    prog: [ // D minor: Dm – Bb – F – C
+      { root: 50, tones: [57, 62, 65] }, { root: 46, tones: [58, 62, 65] },
+      { root: 41, tones: [57, 60, 65] }, { root: 48, tones: [55, 60, 64] }] },
+];
+const LEVELS_PER_WORLD = 3;
+
+// ---------------- seeds ----------------
+// Every run has a seed. Pads, power-ups and invasions come from (seed, pad index), never from a
+// running stream, so two runs on one seed share a layout however differently they are played.
+// That is what makes the daily run fair and lets a ghost from a share link hop on your pads.
+const fmix = h => { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); return (h ^ h >>> 16) >>> 0; };
+let seed = 1;
+const sr = (i, k) => fmix(fmix(fmix(seed) ^ Math.imul(i, 0x9e3779b1)) ^ Math.imul(k, 0x7f4a7c15)) / 4294967296;
+// daily runs are numbered from the first of January 2026, by the player's own calendar
+function today() {
+  const d = new Date();
+  return Math.round((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - Date.UTC(2026, 0, 1)) / 864e5) + 1;
+}
+const dailySeed = n => fmix(n * 7919 + 13);
+
+// ---------------- saved stuff ----------------
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('hopbeat-' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('hopbeat-' + k, JSON.stringify(v)); } catch (e) {} },
+};
+const stats = Object.assign({ runs: 0, best: 0, alt: 0, perfects: 0, repelled: 0, flawless: 0, boss: 0, ghosts: 0, streakMax: 0 },
+  store.get('stats', {}));
+const look = Object.assign({ hat: 'none', phones: 0 }, store.get('look', {}));
+let userOff = +store.get('offset', 0) || 0; // calibrated tap offset, seconds
+
+// ---------------- layout ----------------
+// BP = size unit for pads/dude/rings, VSTEP = pixels climbed per beat
+let W = 0, H = 0, DPR = 1, BP = 150, VSTEP = 140;
+let vignette, sunR = 100;
+// stop-motion: decorative wobble re-rolls 12 times a second, like clay re-posed between frames
+let boil = 0;
+const stars = Array.from({ length: 36 }, () => ({
+  x: Math.random(), y: Math.random(), s: 0.6 + Math.random() * 0.7, p: Math.random() * TAU,
+}));
+// puffy clay clouds pinned at different depths in front of the backdrop
+const clouds = Array.from({ length: 9 }, (_, i) => {
+  const n = 4 + (Math.random() * 3 | 0);
+  return {
+    x: Math.random(), y: i / 9 + Math.random() * 0.08, s: 0.6 + Math.random() * 0.7, d: 0.15 + Math.random() * 0.35,
+    puffs: Array.from({ length: n }, (_, j) => ({
+      x: (j / (n - 1) - 0.5) * 1.7, y: -Math.sin(Math.PI * j / (n - 1)) * (0.35 + Math.random() * 0.25),
+      r: 0.42 + Math.random() * 0.28,
+    })),
+  };
+});
+const floaters = Array.from({ length: 12 }, () => ({
+  x: Math.random(), y: Math.random(), s: 0.6 + Math.random() * 0.8, p: Math.random() * TAU,
+  ch: Math.random() < 0.5 ? '♪' : '♫', col: Math.random() < 0.5 ? PINK : TEAL,
+}));
+function makeRidge(n, amp) {
+  const a = [], p1 = Math.random() * 9, p2 = Math.random() * 9, p3 = Math.random() * 9;
+  for (let i = 0; i < n; i++) {
+    const x = i / n * TAU;
+    a.push(amp * (0.55 + 0.25 * Math.sin(x * 3 + p1) + 0.14 * Math.sin(x * 7 + p2) + 0.06 * Math.sin(x * 17 + p3)));
+  }
+  return a;
+}
+const ridgeFar = makeRidge(48, 0.16), ridgeNear = makeRidge(36, 0.1);
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth || innerWidth; H = cv.clientHeight || innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  BP = clamp(W * 0.28, 100, 180);
+  VSTEP = clamp(H * 0.19, 100, 170);
+  vignette = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+  vignette.addColorStop(0, 'rgba(90,50,30,0)'); vignette.addColorStop(1, 'rgba(90,50,30,0.3)');
+  sunR = Math.min(W, H) * 0.2;
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------------- clay look ----------------
+// speckles plus a few pressed-in fingerprints, tiled over every clay surface
+function makeTex(size, dots, prints) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  const x = c.getContext('2d');
+  for (let i = 0; i < dots; i++) {
+    x.fillStyle = Math.random() < 0.55 ? `rgba(60,35,25,${0.05 + Math.random() * 0.09})` : `rgba(255,255,255,${0.06 + Math.random() * 0.12})`;
+    x.beginPath(); x.arc(Math.random() * size, Math.random() * size, 0.4 + Math.random() * 1.1, 0, TAU); x.fill();
+  }
+  x.lineWidth = 0.9; x.strokeStyle = 'rgba(60,35,25,0.07)';
+  for (let i = 0; i < prints; i++) {
+    const cx = size * (0.3 + Math.random() * 0.4), cy = size * (0.3 + Math.random() * 0.4), a0 = Math.random() * TAU;
+    for (let k = 1; k < 7; k++) {
+      x.beginPath(); x.ellipse(cx, cy, k * 3.4, k * 2.5, a0, a0, a0 + 2 + Math.random() * 1.5); x.stroke();
+    }
+  }
+  return g.createPattern(c, 'repeat');
+}
+const clayPat = makeTex(160, 900, 2), grainPat = makeTex(256, 2600, 0);
+const rgbCache = {};
+const rgbOf = hex => rgbCache[hex] || (rgbCache[hex] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)));
+// blend two hex colours; shade() pushes one toward warm white (k > 0) or deep brown (k < 0)
+function mix(a, b, k) { const p = rgbOf(a), q = rgbOf(b); return `rgb(${p.map((v, i) => Math.round(v + (q[i] - v) * k))})`; }
+// same blend, but as hex so the result can be blended again (world palettes fade into each other)
+const mixHex = (a, b, k) => '#' + rgbOf(a).map((v, i) => Math.round(v + (rgbOf(b)[i] - v) * k).toString(16).padStart(2, '0')).join('');
+const shade = (hex, k) => k < 0 ? mix(hex, '#2a1712', -k) : mix(hex, '#fffaf0', k);
+const hash = (a, b) => { const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return s - Math.floor(s); };
+// a hand-pressed ellipse: its outline shifts a little on every stop-motion frame
+function blob(x, y, rx, ry, seed, amt = 0.035) {
+  const n = 12, pts = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU, w = 1.03 + (hash(i, seed + boil) - 0.5) * 2 * amt;
+    pts.push([x + Math.cos(a) * rx * w, y + Math.sin(a) * ry * w]);
+  }
+  const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+  const s = mid(pts[n - 1], pts[0]);
+  g.beginPath(); g.moveTo(s[0], s[1]);
+  for (let i = 0; i < n; i++) { const e = mid(pts[i], pts[(i + 1) % n]); g.quadraticCurveTo(pts[i][0], pts[i][1], e[0], e[1]); }
+  g.closePath();
+}
+// clay models stand in front of a painted backdrop, so they throw a soft shadow down-right
+function castShadow(s) {
+  g.shadowColor = 'rgba(80,45,25,0.3)'; g.shadowBlur = 12 * s * DPR;
+  g.shadowOffsetX = 6 * s * DPR; g.shadowOffsetY = 10 * s * DPR;
+}
+function noShadow() { g.shadowColor = 'transparent'; g.shadowBlur = g.shadowOffsetX = g.shadowOffsetY = 0; }
+// fill the current path as a lump of clay lit from the top-left, then press the texture into it
+function clayFill(x, y, r, col) {
+  const gr = g.createRadialGradient(x - r * 0.35, y - r * 0.45, r * 0.05, x, y, r * 1.25);
+  gr.addColorStop(0, shade(col, 0.4)); gr.addColorStop(0.45, col); gr.addColorStop(1, shade(col, -0.3));
+  g.fillStyle = gr; g.fill();
+  noShadow();
+  clayPat.setTransform(new DOMMatrix([1, 0, 0, 1, x, y]));
+  g.fillStyle = clayPat; g.fill();
+}
+
+// ---------------- audio ----------------
+let ac = null, master, fx, delayNode, noiseBuf, latency = 0;
+function initAudio() {
+  if (ac) return;
+  ac = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -12; comp.knee.value = 12; comp.ratio.value = 3;
+  comp.attack.value = 0.003; comp.release.value = 0.15;
+  master = ac.createGain(); master.gain.value = 0.75;
+  master.connect(comp); comp.connect(ac.destination);
+  delayNode = ac.createDelay(2); delayNode.delayTime.value = 0.45;
+  const fb = ac.createGain(); fb.gain.value = 0.36;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3000;
+  delayNode.connect(lp); lp.connect(fb); fb.connect(delayNode); lp.connect(master);
+  fx = ac.createGain(); fx.gain.value = 0.35; fx.connect(delayNode);
+  noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+}
+function env(node, t, a, peak, dec) {
+  node.gain.setValueAtTime(0.0001, t);
+  node.gain.exponentialRampToValueAtTime(peak, t + a);
+  node.gain.exponentialRampToValueAtTime(0.0001, t + a + dec);
+}
+function kick(t, v = 1) {
+  const o = ac.createOscillator(), gn = ac.createGain();
+  o.frequency.setValueAtTime(160, t); o.frequency.exponentialRampToValueAtTime(40, t + 0.14);
+  env(gn, t, 0.002, v, 0.38);
+  o.connect(gn).connect(master); o.start(t); o.stop(t + 0.45);
+}
+function noise(t, dur, freq, type, v, send = 0) {
+  const s = ac.createBufferSource(); s.buffer = noiseBuf;
+  const f = ac.createBiquadFilter(); f.type = type; f.frequency.value = freq;
+  const gn = ac.createGain(); env(gn, t, 0.001, v, dur);
+  s.connect(f).connect(gn).connect(master);
+  if (send) { const sg = ac.createGain(); sg.gain.value = send; gn.connect(sg).connect(fx); }
+  s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.05);
+}
+function snare(t, v = 1) {
+  noise(t, 0.2, 1900, 'bandpass', 0.55 * v, 0.4);
+  const o = ac.createOscillator(), gn = ac.createGain(); o.type = 'triangle';
+  o.frequency.setValueAtTime(220, t); o.frequency.exponentialRampToValueAtTime(150, t + 0.08);
+  env(gn, t, 0.001, 0.35 * v, 0.1); o.connect(gn).connect(master); o.start(t); o.stop(t + 0.15);
+}
+function hat(t, v) { noise(t, 0.045, 7500, 'highpass', v); }
+function bass(t, m, dur) {
+  const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m);
+  const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = 7;
+  f.frequency.setValueAtTime(1500, t); f.frequency.exponentialRampToValueAtTime(160, t + dur);
+  const gn = ac.createGain(); env(gn, t, 0.005, 0.3, dur);
+  o.connect(f).connect(gn).connect(master); o.start(t); o.stop(t + dur + 0.05);
+}
+function pad(t, notes, dur) {
+  const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 1000;
+  const gn = ac.createGain();
+  gn.gain.setValueAtTime(0.0001, t); gn.gain.linearRampToValueAtTime(0.05, t + 0.3);
+  gn.gain.setValueAtTime(0.05, t + dur - 0.15); gn.gain.linearRampToValueAtTime(0.0001, t + dur + 0.3);
+  f.connect(gn); gn.connect(master);
+  for (const m of notes) for (const det of [-8, 8]) {
+    const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m); o.detune.value = det;
+    o.connect(f); o.start(t); o.stop(t + dur + 0.35);
+  }
+}
+function pluck(t, m, v, bright) {
+  const f = ac.createBiquadFilter(); f.type = 'lowpass';
+  f.frequency.setValueAtTime(bright ? 6000 : 3000, t); f.frequency.exponentialRampToValueAtTime(700, t + 0.45);
+  const gn = ac.createGain(); env(gn, t, 0.003, v, 0.7);
+  f.connect(gn); gn.connect(master); gn.connect(fx);
+  const o1 = ac.createOscillator(); o1.type = bright ? 'square' : 'triangle'; o1.frequency.value = mtof(m);
+  const o2 = ac.createOscillator(); o2.type = 'sine'; o2.frequency.value = mtof(m + 12);
+  for (const o of [o1, o2]) { o.connect(f); o.start(t); o.stop(t + 0.8); }
+}
+function blip(t, m, v) {
+  const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = mtof(m);
+  const gn = ac.createGain(); env(gn, t, 0.002, v, 0.12);
+  o.connect(gn); gn.connect(master); gn.connect(fx); o.start(t); o.stop(t + 0.16);
+}
+function missSound(t) {
+  const o = ac.createOscillator(); o.type = 'sawtooth';
+  o.frequency.setValueAtTime(260, t); o.frequency.exponentialRampToValueAtTime(70, t + 0.35);
+  const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900;
+  const gn = ac.createGain(); env(gn, t, 0.005, 0.3, 0.35);
+  o.connect(f).connect(gn).connect(master); o.start(t); o.stop(t + 0.45);
+  noise(t, 0.15, 400, 'lowpass', 0.4);
+}
+
+function siren(t) {
+  const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 700;
+  const lfo = ac.createOscillator(); lfo.type = 'triangle'; lfo.frequency.value = 2.5;
+  const depth = ac.createGain(); depth.gain.value = 180;
+  lfo.connect(depth).connect(o.frequency);
+  const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 2200;
+  const gn = ac.createGain();
+  gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(0.11, t + 0.1);
+  gn.gain.setValueAtTime(0.11, t + 1.3); gn.gain.exponentialRampToValueAtTime(0.0001, t + 1.7);
+  o.connect(f).connect(gn); gn.connect(master); gn.connect(fx);
+  o.start(t); lfo.start(t); o.stop(t + 1.75); lfo.stop(t + 1.75);
+}
+function scratch(t) { // vinyl scratch: noise + pitch swept forth and back
+  const s = ac.createBufferSource(); s.buffer = noiseBuf;
+  s.playbackRate.setValueAtTime(0.6, t); s.playbackRate.linearRampToValueAtTime(2.4, t + 0.07);
+  s.playbackRate.linearRampToValueAtTime(0.5, t + 0.16);
+  const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 2;
+  f.frequency.setValueAtTime(900, t); f.frequency.linearRampToValueAtTime(2600, t + 0.07); f.frequency.linearRampToValueAtTime(700, t + 0.16);
+  const gn = ac.createGain(); env(gn, t, 0.005, 0.45, 0.17);
+  s.connect(f).connect(gn).connect(master); s.start(t); s.stop(t + 0.2);
+  const o = ac.createOscillator(); o.type = 'sawtooth';
+  o.frequency.setValueAtTime(260, t); o.frequency.linearRampToValueAtTime(900, t + 0.07); o.frequency.linearRampToValueAtTime(180, t + 0.16);
+  const og = ac.createGain(); env(og, t, 0.005, 0.08, 0.16);
+  o.connect(og).connect(master); o.start(t); o.stop(t + 0.2);
+}
+function stab(t, notes, v) {
+  const f = ac.createBiquadFilter(); f.type = 'lowpass';
+  f.frequency.setValueAtTime(3500, t); f.frequency.exponentialRampToValueAtTime(600, t + 0.2);
+  const gn = ac.createGain(); env(gn, t, 0.003, v, 0.2);
+  f.connect(gn); gn.connect(master); gn.connect(fx);
+  for (const m of notes) {
+    const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m);
+    o.connect(f); o.start(t); o.stop(t + 0.25);
+  }
+}
+
+// ---------------- musical timeline ----------------
+let keyShift = 0; // semitones; invaders drag the whole track into their key
+// steps[i] = audio-clock time of 16th-note i. Tempo changes land on bar lines.
+let steps = [], stepBpm = [], stepWorld = [], genTime = 0, bpm = START_BPM, targetBpm = START_BPM, schedIdx = 0;
+// world changes also land on bar lines; shownWorld follows what is actually being heard
+let world = 0, targetWorld = 0, worldStart = 0, shownWorld = 0, worldFrom = 0, worldT0 = -9;
+function ensureSteps(i) {
+  while (steps.length <= i) {
+    if (steps.length % 16 === 0) {
+      if (bpm !== targetBpm) {
+        bpm = targetBpm;
+        delayNode.delayTime.setValueAtTime(0.75 * 60 / bpm, genTime);
+      }
+      world = targetWorld;
+    }
+    steps.push(genTime); stepBpm.push(bpm); stepWorld.push(world);
+    genTime += 60 / bpm / 4;
+  }
+}
+const chordAt = i => WORLDS[stepWorld[i] || 0].prog[Math.floor(i / 16) % 4];
+function playStep(i, t) {
+  const s = i % 16, ch = chordAt(i), sd = 60 / stepBpm[i] / 4, k = keyShift;
+  const tones = ch.tones.map(n => n + k);
+  if (stepWorld[i] !== shownWorld) {
+    worldFrom = shownWorld; shownWorld = stepWorld[i];
+    worldT0 = performance.now() / 1000 + (t - ac.currentTime);
+    banner = { text: WORLDS[shownWorld].name, sub: 'new world', col: CREAM, t0: worldT0 };
+  }
+  // the boss's second half swaps the groove for a broken beat
+  const brk = inv && inv.phase === 'on' && inv.genre;
+  if (brk) {
+    if (s === 0 || s === 10) kick(t, 1);
+    if (s === 4 || s === 12) snare(t);
+    if (s === 7 || s === 15) snare(t, 0.25);
+    hat(t, s % 2 ? 0.07 : 0.16);
+  } else {
+    if (s % 4 === 0) kick(t, s === 0 ? 1 : 0.85);
+    if (s === 4 || s === 12) snare(t);
+    if (s % 4 === 2) hat(t, 0.2); else if (level >= 2 && s % 2 === 1) hat(t, 0.06);
+  }
+  if (s === 0) pad(t, tones, sd * 16);
+  if (s % 2 === 0) bass(t, ch.root + k + (s % 8 === 6 ? 12 : 0), sd * 1.8);
+  if (level >= 3 && s % 2 === 1) blip(t, tones[(s >> 1) % 3] + 24, 0.03);
+  if (level >= 4 && s === 14) snare(t, 0.35);
+  // the invader's own layer: syncopated saw stabs and an extra clap
+  if (inv && inv.phase === 'on') {
+    if (s === 0 || s === 6 || s === 10) stab(t, tones.map(n => n + 12), 0.045);
+    if (s === 15) snare(t, 0.3);
+  }
+}
+function scheduler() {
+  const horizon = ac.currentTime + 0.15;
+  for (;;) {
+    ensureSteps(schedIdx);
+    if (steps[schedIdx] > horizon) break;
+    playStep(schedIdx, steps[schedIdx]);
+    schedIdx++;
+  }
+}
+setInterval(() => { if (state === 'play' && !paused) scheduler(); else if (state === 'calib') calibSched(); }, 25);
+// game time = when the sound reaches your ears, minus however late your fingers land (calibrated)
+const now = () => ac ? ac.currentTime - latency - userOff : performance.now() / 1000;
+const curBpm = () => stepBpm[Math.max(0, schedIdx - 1)] || START_BPM;
+
+// ---------------- game state ----------------
+// title / play / over, plus the menu screens: calib (timing), closet (looks), dj (build a set)
+let state = 'title', paused = false;
+let plats = [], cur = 0, ivQueue = [], padN = 0;
+let score = 0, combo = 0, maxCombo = 0, lives = 3, jumps = 0, level = 1;
+let best = +store.get('best', 0) || 0;
+let camY = 0, camY0 = 0, dude, parts = [], pops = [], trail = [], ripples = [];
+let shake = 0, flash = 0, flashCol = '255,255,255', banner = null, overT = 0, newBest = false;
+// mode: 'endless' (fresh seed), 'daily' (today's seed) or 'challenge' (opened from a friend's link)
+let mode = 'endless', dailyNo = 0, runLog = '', runPerfects = 0, unlockedNow = [], overInfo = null;
+
+// power-ups ride on pads; land on the pad to collect
+const POWERS = {
+  shield: { col: TEAL, name: 'SHIELD', sub: 'blocks one miss', w: 3 },
+  double: { col: GOLD, name: '2× SCORE', sub: 'for 16 hops', w: 3, n: 16 },
+  wide:   { col: MINT, name: 'BIG PADS', sub: 'easier to hit', w: 3, n: 12 },
+  heart:  { col: PINK, name: '+1 LIFE', sub: '', w: 2 },
+  rocket: { col: ORANGE, name: 'ROCKET!', sub: 'autopilot', w: 2, n: 8 },
+};
+let pw = { shield: 0, double: 0, wide: 0, rocket: 0 };
+function pickPower(i) {
+  const keys = Object.keys(POWERS);
+  let r = sr(i, 5) * keys.reduce((a, k) => a + POWERS[k].w, 0);
+  for (const k of keys) if ((r -= POWERS[k].w) < 0) return k;
+  return keys[0];
+}
+
+// ---------------- DJ invasions ----------------
+// An invader is a "brain" that picks remix moves against your tower: an AI personality, the boss,
+// or a friend's set that arrived in a link and plays its moves in order.
+const INV_WARN = 3, INV_LEN = 16, BOSS_LEN = 24;
+const MOVES = {
+  decoy:    'FAKE PAD!',
+  drift:    'WOBBLE!',
+  rush:     'RUSH!',
+  shrink:   'SHRINK!',
+  blackout: 'LIGHTS OUT!',
+  double:   'DOUBLE TIME!',
+};
+const MOVE_CODE = { decoy: 'd', drift: 'w', rush: 'r', shrink: 's', blackout: 'b', double: 't' };
+const INVADERS = [
+  { name: 'DJ GLITCH', col: '#dd3f35', rgb: '221,63,53', transpose: 3, fav: ['decoy', 'blackout'],
+    taunts: ['can’t trust your eyes', 'glitch in the matrix', 'which one is real?'] },
+  { name: 'MC TURBO', col: '#f28a3a', rgb: '242,138,58', transpose: 5, fav: ['double', 'rush'],
+    taunts: ['too slow!', 'speed it UP', 'keep up, rookie'] },
+  { name: 'LADY WOBBLE', col: '#8a6ad6', rgb: '138,106,214', transpose: -2, fav: ['drift', 'shrink'],
+    taunts: ['feeling dizzy?', 'wobble wobble', 'tiny pads, big trouble'] },
+];
+// every third invasion is the boss: a longer set that flips genre halfway through
+const BOSS = { name: 'THE REMIXER', col: '#3a8fd6', rgb: '58,143,214', transpose: -5, boss: true,
+  fav: ['rush', 'decoy'], fav2: ['double', 'blackout', 'shrink'],
+  taunts: ['you call that a drop?', 'remixing your life', 'encore? no.'] };
+const DJ_COLS = [RED, ORANGE, '#8a6ad6', '#3a8fd6', MINT];
+let friendDJ = null; // a friend's invader for this run, from a link
+let inv = null, invN = 0, nextInvasionAt = 24, blackoutUntil = 0, killer = null, lastJudged = 0;
+function aiDecide(who, i) {
+  const keys = Object.keys(MOVES), fav = who.boss && inv.genre ? who.fav2 : who.fav;
+  const w = keys.map(k => fav.includes(k) ? 4 : 1);
+  let r = sr(i, 30) * w.reduce((a, b) => a + b, 0);
+  for (let j = 0; j < keys.length; j++) if ((r -= w[j]) < 0) return keys[j];
+  return keys[0];
+}
+function say(text) { if (inv) inv.say = { text, t0: performance.now() / 1000 }; }
+function taunt(i) { const tt = inv.who.taunts; return tt[sr(i, 33) * tt.length | 0]; }
+function startInvasion(i) {
+  const who = friendDJ && invN === 0 ? friendDJ : invN % 3 === 2 ? BOSS : INVADERS[sr(invN, 20) * INVADERS.length | 0];
+  invN++;
+  inv = { who, phase: 'warn', count: 0, len: who.boss ? BOSS_LEN : INV_LEN, genre: 0, moveN: 0,
+    onHits: 0, misses: 0, stolen: 0, inT: performance.now() / 1000, outT: 0, beam: null, say: null, lost: false };
+  banner = { text: who.boss ? 'BOSS INVASION!' : 'INVADED!', sub: `${who.name} entered your world`, col: who.col, t0: inv.inT };
+  if (pw.rocket) { pw.rocket = 0; popup(px(plats[cur]), platTop(plats[cur]) - BP * 0.75, 'ROCKET JAMMED!', RED); }
+  siren(ac.currentTime + 0.02);
+  say(who.friend ? 'surprise! it’s me' : 'your beat is mine now');
+}
+function endInvasion() {
+  const flawless = inv.misses === 0, who = inv.who;
+  const bonus = inv.onHits * 100 * (flawless ? 2 : 1) * (who.boss ? 2 : 1);
+  score += bonus;
+  stats.repelled++; if (flawless) stats.flawless++; if (who.boss) stats.boss++;
+  if (who.friend) friendDJ.beaten = true;
+  banner = { text: flawless ? 'FLAWLESS!' : 'REPELLED!', sub: `+${bonus}  ·  ${who.name} fled`, col: GOLD, t0: performance.now() / 1000 };
+  inv.phase = 'leave'; inv.outT = performance.now() / 1000; inv.lost = true;
+  say('nooo my set!');
+  keyShift = 0;
+  nextInvasionAt = lastJudged + 40 + (sr(lastJudged, 21) * 20 | 0);
+  const at = ac.currentTime + 0.05;
+  [0, 4, 7, 12, 16, 19, 24].forEach((n, k) => blip(at + k * 0.06, 69 + n, 0.1));
+}
+// called once per judged pad (hit, miss or shield save) with that pad's index; invasions start
+// and act by pad index, so a ghost on the same seed met the same DJs at the same pads
+function invTick(ok, t, i) {
+  lastJudged = i;
+  if (!inv) {
+    if (state === 'play' && i >= nextInvasionAt) startInvasion(i);
+    return;
+  }
+  if (inv.phase === 'leave') return;
+  inv.count++;
+  if (inv.phase === 'warn') {
+    if (inv.count >= INV_WARN) { inv.phase = 'on'; inv.count = 0; keyShift = inv.who.transpose; say('drop the beat!'); }
+    return;
+  }
+  if (ok) inv.onHits++; else inv.misses++;
+  if (inv.count >= inv.len) return endInvasion();
+  if (inv.who.boss && inv.count === inv.len / 2) {
+    inv.genre = 1; keyShift = inv.who.transpose + 7;
+    banner = { text: 'GENRE SWITCH!', sub: '→ BREAKBEAT', col: inv.who.col, t0: performance.now() / 1000 };
+    say('let’s change it up');
+    scratch(ac.currentTime + 0.01);
+    return;
+  }
+  if (inv.count % (inv.who.boss ? 2 : 3) === 1) {
+    const set = inv.who.set;
+    invaderAct(set ? set[inv.moveN++ % set.length] : aiDecide(inv.who, i), t, i);
+  }
+}
+function invaderAct(move, t, i) {
+  const p = plats[cur + 2];
+  if (!p || p.state !== 0) return;
+  const ahead = [plats[cur + 2], plats[cur + 3], plats[cur + 4]].filter(q => q && q.state === 0);
+  if (move === 'decoy') {
+    const dx = (p.x > 0.5 ? -1 : 1) * (0.26 + sr(i, 31) * 0.1);
+    p.decoy = { x: clamp(p.x + dx, 0.12, 0.88), v: p.v, state: 0, off: p.off, hitT: -9, glitch: true };
+  } else if (move === 'drift') ahead.slice(0, 2).forEach((q, k) => { q.drift = 1 + sr(i, 32 + k) * 5; });
+  else if (move === 'rush') ahead.forEach(q => { q.rush = true; });
+  else if (move === 'shrink') ahead.forEach(q => { q.shrink = true; });
+  else if (move === 'blackout') blackoutUntil = ahead[ahead.length - 1].time + 0.05;
+  else if (move === 'double') ivQueue = [0.5, 0.5, 0.5, 0.5].concat(ivQueue);
+  p.fxT = t;
+  inv.beam = { p, t0: performance.now() / 1000 };
+  say(MOVES[move]);
+  scratch(ac.currentTime + 0.01);
+}
+
+// world coords: x is screen x at the dude's depth, y grows downward and pads climb to negative y.
+// proj() adds a gentle perspective: higher up the screen = further away = smaller and closer to centre.
+let clock = 0; // current game time, for pads the invader made wobble
+const px = p => (p.x + (p.drift ? Math.sin(clock * 2.4 + p.drift) * 0.11 : 0)) * W;
+const wy = p => -p.v * VSTEP;
+function platTop(p) { return wy(p); }
+function homeCam() { camY = camY0 = -H * 0.72; }
+function depthAt(sy) { return clamp(0.74 + 0.42 * (sy / H), 0.66, 1.2); }
+function tiltAt(sy) { return clamp(0.16 + 0.24 * (sy / H), 0.12, 0.42); }
+function proj(x, y) { const sy = y - camY, s = depthAt(sy); return { x: W / 2 + (x - W / 2) * s, y: sy, s }; }
+// rhythm pools unlock by pad index (not by your hits), so the layout never depends on how you play
+function nextInterval(i) {
+  if (!ivQueue.length) {
+    const lv = 1 + Math.floor(i / JUMPS_PER_LEVEL);
+    const pool = POOLS.slice(0, Math.min(lv, POOLS.length)).flat();
+    ivQueue = pool[sr(i, 1) * pool.length | 0].slice();
+  }
+  return ivQueue.shift();
+}
+function addPlatform() {
+  const last = plats[plats.length - 1], i = padN++;
+  const iv = nextInterval(i);
+  const step = last.step + Math.round(iv * 4);
+  ensureSteps(step);
+  // sideways hop so every pad is a new spot to hit; short hops for fast notes
+  const shift = iv < 1 ? 0.12 + sr(i, 2) * 0.12 : 0.18 + sr(i, 2) * 0.28;
+  let x = last.x + (sr(i, 3) < 0.5 ? -shift : shift);
+  if (x < 0.16 || x > 0.84) x = last.x * 2 - x;
+  x = clamp(x, 0.16, 0.84);
+  const p = { i, step, time: steps[step], x, v: last.v + clamp(iv, 0.6, 1.5), state: 0, off: step % 4 !== 0, hitT: -9 };
+  if (i > 10 && sr(i, 4) < 0.11 && !plats.some(q => q.power && q.state === 0)) p.power = pickPower(i);
+  plats.push(p);
+}
+function newDude(p) {
+  return { from: p, to: p, t0: 0, dur: 0, jumping: false, squash: 0, hurtT: -9, dead: false, blink: 2 };
+}
+function setupTitle() {
+  plats = [{ x: 0.3, v: 0, state: 1, off: false, hitT: -9 }, { x: 0.68, v: 0.9, state: 0, off: false, hitT: -9 },
+           { x: 0.42, v: 1.7, state: 0, off: true, hitT: -9, power: 'rocket' }];
+  cur = 0; dude = newDude(plats[0]);
+  homeCam();
+}
+function startGame(m = mode) {
+  initAudio();
+  if (ac.state !== 'running') ac.resume();
+  mode = m; ghost = null; friendDJ = null; dailyNo = 0;
+  if (m === 'daily') { dailyNo = today(); seed = dailySeed(dailyNo); }
+  else if (m === 'challenge') {
+    const c = challenge;
+    dailyNo = c.daily || 0;
+    seed = c.seed != null ? c.seed : (Math.random() * 4294967296) >>> 0;
+    if (c.ghost) ghost = makeGhost(c.ghost, c.gscore);
+    if (c.dj) friendDJ = Object.assign({}, c.dj, { beaten: false });
+  } else seed = (Math.random() * 4294967296) >>> 0;
+  worldStart = dailyNo ? seed % WORLDS.length : 0;
+  world = targetWorld = shownWorld = worldFrom = worldStart; worldT0 = -9;
+  steps = []; stepBpm = []; stepWorld = []; bpm = targetBpm = START_BPM; genTime = ac.currentTime + 0.12; schedIdx = 0;
+  delayNode.delayTime.setValueAtTime(0.75 * 60 / bpm, ac.currentTime);
+  score = 0; combo = 0; maxCombo = 0; lives = 3; jumps = 0; level = 1; ivQueue = [1]; padN = 1;
+  runLog = ''; runPerfects = 0; overInfo = null; unlockedNow = unlockedIds();
+  pw = { shield: 0, double: 0, wide: 0, rocket: 0 };
+  inv = null; invN = 0; nextInvasionAt = friendDJ ? 14 : 24; keyShift = 0; blackoutUntil = 0; killer = null; lastJudged = 0;
+  state = 'play';
+  ensureSteps(12);
+  plats = [{ i: 0, step: 12, time: steps[12], x: 0.5, v: 0, state: 1, off: false, hitT: -9 }];
+  cur = 0;
+  while (plats.length < 5) addPlatform();
+  dude = newDude(plats[0]);
+  homeCam();
+  parts = []; pops = []; trail = []; ripples = [];
+  banner = null; newBest = false; paused = false;
+  state = 'play';
+}
+
+// ---------------- gameplay ----------------
+function jumpTo(p, t, hurt) {
+  dude.from = dude.to; dude.to = p; dude.t0 = t;
+  dude.dur = Math.min(0.24, 0.42 * 60 / curBpm());
+  dude.jumping = true;
+  if (hurt) dude.hurtT = t;
+  cur = plats.indexOf(p);
+}
+function hit(p, grade, t) {
+  p.state = 1; p.hitT = t; p.grade = grade;
+  combo++; jumps++; maxCombo = Math.max(maxCombo, combo);
+  const mult = Math.min(8, 1 + Math.floor(combo / 8));
+  const perfect = grade === 'PERFECT';
+  runLog += perfect ? 'p' : 'g';
+  if (perfect && !pw.rocket) runPerfects++;
+  score += (perfect ? 100 : 50) * mult * (pw.double ? 2 : 1);
+  jumpTo(p, t, false);
+  if (pw.double) pw.double--;
+  if (pw.wide) pw.wide--;
+  if (pw.rocket) pw.rocket--;
+  if (p.power) collect(p);
+  // the player plays the melody: arpeggio over the current chord
+  const ch = chordAt(p.step).tones;
+  const k = keyShift + 12;
+  const seq = [ch[0] + k, ch[1] + k, ch[2] + k, ch[0] + k + 12, ch[2] + k, ch[1] + k];
+  const at = ac.currentTime + 0.005;
+  pluck(at, seq[(combo - 1) % seq.length], perfect ? 0.32 : 0.24, perfect);
+  if (perfect && combo % 4 === 0) blip(at + 0.06, seq[(combo + 2) % seq.length] + 12, 0.08);
+  const x = px(p), y = platTop(p);
+  burst(x, y, perfect ? GOLD : (p.off ? PINK : TEAL), perfect ? 26 : 14, perfect ? 420 : 280);
+  popup(x, y - BP * 0.45, grade, perfect ? GOLD : TEAL);
+  if (perfect) { flash = 0.12; flashCol = '255,240,200'; }
+  if (combo % 32 === 0 && lives < 3) { lives++; popup(x, y - BP * 0.75, '+1 ♥', PINK); }
+  if (jumps % JUMPS_PER_LEVEL === 0) {
+    level++;
+    targetBpm = Math.min(MAX_BPM, START_BPM + (level - 1) * BPM_STEP);
+    banner = { text: 'SPEED UP!', sub: targetBpm + ' BPM', t0: performance.now() / 1000 };
+    [0, 4, 7, 12].forEach((n, i) => blip(at + 0.12 + i * 0.07, 69 + n, 0.09));
+    if ((level - 1) % LEVELS_PER_WORLD === 0) targetWorld = (worldStart + (level - 1) / LEVELS_PER_WORLD) % WORLDS.length;
+  }
+  invTick(true, t, p.i);
+}
+function collect(p) {
+  const k = p.power, P = POWERS[k];
+  p.power = null;
+  if (k === 'heart') { if (lives < 3) lives++; else score += 500; }
+  else if (k === 'shield') pw.shield = 1;
+  else pw[k] = P.n;
+  banner = { text: P.name, sub: P.sub, col: P.col, t0: performance.now() / 1000 };
+  const at = ac.currentTime + 0.02;
+  [0, 4, 7, 12, 16].forEach((n, i) => blip(at + i * 0.05, 72 + n, 0.1));
+  burst(px(p), platTop(p) - BP * 0.5, P.col, 30, 380);
+}
+function miss(p, why, t) {
+  if (pw.shield) { // the shield eats the miss: land safely, keep the combo
+    pw.shield = 0; p.state = 1; p.hitT = t; p.grade = 'GOOD'; runLog += 'g';
+    popup(px(p), platTop(p) - BP * 0.45, 'SHIELD!', TEAL);
+    blip(ac.currentTime + 0.005, 84, 0.12); blip(ac.currentTime + 0.08, 79, 0.1);
+    burst(px(p), platTop(p) - BP * 0.15, TEAL, 24, 320);
+    jumpTo(p, t, false);
+    invTick(true, t, p.i);
+    return;
+  }
+  p.state = 2; p.hitT = t; runLog += 'm';
+  combo = 0; lives--;
+  shake = 14; flash = 0.45; flashCol = '255,40,90';
+  missSound(ac.currentTime + 0.005);
+  popup(px(p), platTop(p) - BP * 0.45, why, RED);
+  if (inv && inv.phase === 'on') { // the invader steals a cut of your score
+    const st = Math.round(score * 0.1);
+    score -= st; inv.stolen += st;
+    const who = inv.who;
+    say(st ? `-${st}  ${taunt(p.i)}` : who.taunts[0]);
+  }
+  if (lives <= 0) return die(t);
+  jumpTo(p, t, true);
+  invTick(false, t, p.i);
+}
+function die(t) {
+  state = 'over'; overT = performance.now() / 1000;
+  if (inv && inv.phase !== 'leave') { killer = inv.who.name; say('GG, too easy'); }
+  const pos = dudePos(t);
+  const target = plats[cur + 1];
+  dude.dead = true; dude.deadT = overT; dude.dx = pos.x; dude.dy = pos.y;
+  dude.dvx = target ? (px(target) - pos.x) * 0.6 : 0;
+  if (score > best) { best = score; newBest = true; store.set('best', best); }
+  const at = ac.currentTime + 0.3;
+  [64, 60, 57, 52].forEach((m, i) => pluck(at + i * 0.18, m, 0.22, false));
+  finishRun();
+}
+// bank the run: stats, today's daily and streak, ghost result, and anything it unlocked
+function finishRun() {
+  const alt = Math.round((plats[cur] ? plats[cur].v : 0) * 3);
+  const info = { alt, streak: 0, dailyBest: 0, ghostWin: null, unlocked: [] };
+  stats.runs++; stats.best = Math.max(stats.best, score); stats.alt = Math.max(stats.alt, alt);
+  stats.perfects += runPerfects;
+  if (ghost) { info.ghostWin = score > ghost.score; if (info.ghostWin) stats.ghosts++; }
+  if (dailyNo && dailyNo === today()) {
+    const d = store.get('daily', {});
+    info.dailyBest = d.day === dailyNo ? Math.max(d.best, score) : score;
+    store.set('daily', { day: dailyNo, best: info.dailyBest });
+    const st = store.get('streak', { last: 0, n: 0 });
+    if (st.last !== dailyNo) { st.n = st.last === dailyNo - 1 ? st.n + 1 : 1; st.last = dailyNo; store.set('streak', st); }
+    info.streak = st.n; stats.streakMax = Math.max(stats.streakMax, st.n);
+  }
+  store.set('stats', stats);
+  const was = new Set(unlockedNow);
+  info.unlocked = unlockedIds().filter(id => !was.has(id)).map(id => itemById(id).name);
+  overInfo = info;
+}
+function onTap(cx, cy) {
+  const rt = performance.now() / 1000;
+  if (state !== 'play') { // menus: buttons drawn last frame
+    if (state === 'over' && rt - overT < 0.9) return;
+    const b = btns.find(b => cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h);
+    if (b && !b.off) press(b.id);
+    return;
+  }
+  if (paused || !audioLive()) { ac.resume(); paused = false; return; }
+  const t = now(), p = plats[cur + 1];
+  if (!p) return;
+  ripples.push({ x: cx, y: cy, t0: rt });
+  if (pw.rocket) return; // autopilot
+  const dt = t - p.time;
+  if (dt < -EARLY_IGNORE) return;
+  const q = proj(px(p), wy(p));
+  const rad = Math.max(52, BP * 0.5) * q.s * (pw.wide ? 1.8 : 1) * (p.shrink ? 0.65 : 1);
+  if (Math.hypot(cx - q.x, cy - q.y) > rad) {
+    const dq = p.decoy && proj(px(p.decoy), wy(p.decoy));
+    return miss(p, dq && Math.hypot(cx - dq.x, cy - dq.y) < rad * 1.3 ? 'DECOY!' : 'WRONG SPOT', t);
+  }
+  const a = Math.abs(dt);
+  if (a <= PERFECT_WIN) hit(p, 'PERFECT', t);
+  else if (a <= GOOD_WIN) hit(p, 'GOOD', t);
+  else miss(p, dt < 0 ? 'TOO EARLY' : 'TOO LATE', t);
+}
+// Phones only allow audio to start on finger-up (pointerdown from touch is not a "user
+// activation"), and the audio clock drives the whole game. So starting and resuming happen
+// on pointerup; gameplay taps stay on pointerdown for the lowest latency.
+const audioLive = () => ac && ac.state === 'running';
+function tapAt(e) { const r = cv.getBoundingClientRect(); onTap(e.clientX - r.left, e.clientY - r.top); }
+// taps that are judged against the beat (play, calibration) go on pointerdown, buttons on pointerup
+const beatTaps = () => (state === 'play' || state === 'calib') && audioLive() && !paused;
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (!beatTaps()) return;
+  if (state === 'calib') { const r = cv.getBoundingClientRect(); if (e.clientY - r.top < calibZone()) calibTap(); }
+  else tapAt(e);
+});
+cv.addEventListener('pointerup', e => {
+  e.preventDefault();
+  if (!(state === 'play' && beatTaps())) tapAt(e);
+});
+addEventListener('keydown', e => {
+  if (e.code === 'Escape' && state !== 'play') { e.preventDefault(); toTitle(); return; }
+  if (e.code !== 'Space' && e.code !== 'Enter') return;
+  e.preventDefault();
+  if (e.repeat) return;
+  const p = plats[cur + 1];
+  if (state === 'play' && p) { const q = proj(px(p), wy(p)); onTap(q.x, q.y); }
+  else if (state === 'calib') { if (audioLive()) calibTap(); }
+  else if (state === 'title') startGame(challenge ? 'challenge' : 'endless');
+  else if (state === 'over' && performance.now() / 1000 - overT > 0.9) startGame(mode);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play' && ac) { ac.suspend(); paused = true; }
+});
+
+function update(t) {
+  let p = plats[cur + 1];
+  if (pw.rocket && p && p.state === 0 && t >= p.time - 0.01) { hit(p, 'PERFECT', t); p = plats[cur + 1]; }
+  if (p && p.state === 0 && t > p.time + GOOD_WIN) miss(p, 'MISS', t);
+  if (state !== 'play') return;
+  while (plats.length - cur < 5) addPlatform();
+  while (cur > 3) { plats.shift(); cur--; }
+}
+
+// ---------------- fx helpers ----------------
+function burst(x, y, col, n, spd) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU, s = spd * (0.3 + Math.random() * 0.7);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - spd * 0.35, life: 1,
+      dec: 1.1 + Math.random() * 1.2, size: 1.5 + Math.random() * 3, col });
+  }
+}
+function popup(x, y, text, col) { pops.push({ x, y, text, col, t0: performance.now() / 1000 }); }
+function rr(x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function heart(x, y, s) {
+  g.beginPath(); g.moveTo(x, y + s * 0.3);
+  g.bezierCurveTo(x, y, x - s * 0.5, y, x - s * 0.5, y + s * 0.3);
+  g.bezierCurveTo(x - s * 0.5, y + s * 0.6, x, y + s * 0.8, x, y + s);
+  g.bezierCurveTo(x, y + s * 0.8, x + s * 0.5, y + s * 0.6, x + s * 0.5, y + s * 0.3);
+  g.bezierCurveTo(x + s * 0.5, y, x, y, x, y + s * 0.3);
+}
+// chunky clay letters: a dark extruded body and outline under the lit face
+function clayText(text, x, y, size, col, weight = 700) {
+  g.font = `${weight} ${size}px ${FONT}`;
+  const d = Math.max(2, size * 0.07), dark = shade(col, -0.55);
+  g.lineJoin = 'round'; g.lineWidth = Math.max(2, size * 0.1); g.strokeStyle = dark; g.fillStyle = dark;
+  for (let k = d; k > 0; k -= 1.5) { g.strokeText(text, x, y + k); g.fillText(text, x, y + k); }
+  g.strokeText(text, x, y);
+  g.fillStyle = col; g.fillText(text, x, y);
+}
+
+// ---------------- dude ----------------
+function dudePos(t) {
+  const j = dude;
+  const tx = px(j.to), ty = platTop(j.to);
+  if (!j.jumping) return { x: tx, y: ty, air: false };
+  let k = (t - j.t0) / j.dur;
+  if (k >= 1) {
+    j.jumping = false; j.squash = 1;
+    burst(tx, ty, '#e8d6bf', 8, 160);
+    return { x: tx, y: ty, air: false };
+  }
+  k = clamp(k, 0, 1);
+  const fx0 = px(j.from), fy0 = platTop(j.from);
+  // rise fast, hang a little, settle onto the pad
+  const ky = 1 - Math.pow(1 - k, 2);
+  return { x: lerp(fx0, tx, k), y: lerp(fy0, ty, ky) - Math.sin(k * Math.PI) * BP * 0.35, air: true };
+}
+function drawDude(x, y, t, air, pulse, rot, ps) {
+  const R = BP * 0.15 * ps;
+  const hurt = t - dude.hurtT < 0.45 || dude.dead;
+  let sx = 1 + dude.squash * 0.28, sy = 1 - dude.squash * 0.28;
+  if (air) { sx = 0.88; sy = 1.14; } else { sy -= pulse * 0.07; sx += pulse * 0.05; }
+  g.save(); g.translate(x, y);
+  if (pw.rocket && !dude.dead) { // clay flame: three stacked tongues, re-posed every frame
+    const fl = R * (1.4 + hash(boil, 3) * 0.6);
+    for (const [c, w, l] of [[RED, 0.5, 1.3], [ORANGE, 0.36, 1.05], [GOLD, 0.2, 0.75]]) {
+      g.beginPath(); g.moveTo(-R * w, -R * 0.1); g.quadraticCurveTo(0, fl * l * 1.3, R * w, -R * 0.1);
+      clayFill(0, 0, fl * l, c);
+    }
+  }
+  g.rotate(rot); g.scale(sx, sy);
+  const cy = -R * 1.05;
+  // feet
+  for (const s of [-1, 1]) {
+    g.beginPath(); g.ellipse(s * R * 0.42, -R * 0.12, R * 0.3, R * 0.17, 0, 0, TAU);
+    clayFill(s * R * 0.42, -R * 0.12, R * 0.3, '#7a5444');
+  }
+  // body, with a little sheen where the light catches the clay
+  castShadow(ps); blob(0, cy, R, R, 7, 0.03); clayFill(0, cy, R, hurt ? RED : DUDE);
+  g.fillStyle = 'rgba(255,250,240,0.45)';
+  g.beginPath(); g.ellipse(-R * 0.42, cy - R * 0.5, R * 0.2, R * 0.11, -0.6, 0, TAU); g.fill();
+  // headphones: a rolled clay band and two cups
+  const phc = PHONES[look.phones] ? PHONES[look.phones].col : TEAL;
+  g.lineCap = 'round';
+  g.strokeStyle = shade(phc, -0.35); g.lineWidth = R * 0.2;
+  g.beginPath(); g.arc(0, cy + R * 0.04, R * 1.12, Math.PI * 1.12, Math.PI * 1.88); g.stroke();
+  g.strokeStyle = phc; g.lineWidth = R * 0.14;
+  g.beginPath(); g.arc(0, cy, R * 1.12, Math.PI * 1.12, Math.PI * 1.88); g.stroke();
+  for (const s of [-1, 1]) {
+    rr(s * R * 1.08 - R * 0.2, cy - R * 0.32, R * 0.4, R * 0.62, R * 0.18);
+    clayFill(s * R * 1.08, cy, R * 0.35, phc);
+  }
+  if (look.hat !== 'none') drawHat(look.hat, R, cy, t);
+  // eyes
+  const tgt = plats[cur + 1];
+  let lx = 1, ly = 0;
+  if (tgt) { const tq = proj(px(tgt), platTop(tgt)); lx = tq.x - x; ly = tq.y - y; const l = Math.hypot(lx, ly) || 1; lx /= l; ly /= l; }
+  dude.blink -= 1 / 60;
+  if (dude.blink < -0.12) dude.blink = 2 + Math.random() * 3;
+  const blinking = dude.blink < 0;
+  for (const s of [-1, 1]) {
+    const ex = s * R * 0.33 + R * 0.08, ey = cy - R * 0.12;
+    if (hurt) {
+      g.strokeStyle = INK; g.lineWidth = R * 0.1;
+      const k = R * 0.13;
+      g.beginPath(); g.moveTo(ex - k, ey - k); g.lineTo(ex + k, ey + k); g.moveTo(ex + k, ey - k); g.lineTo(ex - k, ey + k); g.stroke();
+    } else {
+      g.fillStyle = '#fffaf0'; g.beginPath(); g.ellipse(ex, ey, R * 0.21, blinking ? R * 0.03 : R * 0.26, 0, 0, TAU); g.fill();
+      if (!blinking) {
+        g.fillStyle = INK; g.beginPath(); g.arc(ex + lx * R * 0.09, ey + ly * R * 0.1, R * 0.12, 0, TAU); g.fill();
+        g.fillStyle = '#fff'; g.beginPath(); g.arc(ex + lx * R * 0.09 - R * 0.04, ey + ly * R * 0.1 - R * 0.05, R * 0.04, 0, TAU); g.fill();
+      }
+    }
+  }
+  // mouth
+  g.strokeStyle = INK; g.lineWidth = R * 0.08; g.beginPath();
+  if (hurt) g.arc(R * 0.08, cy + R * 0.5, R * 0.16, Math.PI * 1.15, Math.PI * 1.85);
+  else g.arc(R * 0.08, cy + R * 0.22, R * 0.2, Math.PI * 0.15, Math.PI * 0.85);
+  g.stroke();
+  // cheeks
+  g.fillStyle = 'rgba(225,75,105,0.4)';
+  for (const s of [-1, 1]) { g.beginPath(); g.ellipse(s * R * 0.58 + R * 0.08, cy + R * 0.2, R * 0.12, R * 0.07, 0, 0, TAU); g.fill(); }
+  g.restore();
+  if (pw.shield && !dude.dead) { // shield: a ring of rolled clay around a soft bubble
+    const sr = R * 1.65, sy0 = y - R * 1.05;
+    g.fillStyle = 'rgba(47,176,163,0.12)'; g.beginPath(); g.arc(x, sy0, sr, 0, TAU); g.fill();
+    g.globalAlpha = 0.6 + 0.25 * Math.sin(t * 6); g.lineWidth = 4;
+    g.strokeStyle = shade(TEAL, -0.35); g.beginPath(); g.arc(x, sy0 + 2, sr, 0, TAU); g.stroke();
+    g.strokeStyle = TEAL; g.beginPath(); g.arc(x, sy0, sr, 0, TAU); g.stroke();
+    g.globalAlpha = 1;
+  }
+}
+// spinning power-up coin icons
+function drawIcon(k, r) {
+  g.fillStyle = INK; g.strokeStyle = INK; g.lineWidth = r * 0.16; g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath();
+  if (k === 'shield') {
+    g.moveTo(0, -r * 0.55); g.lineTo(r * 0.45, -r * 0.35); g.lineTo(r * 0.38, r * 0.15);
+    g.quadraticCurveTo(r * 0.2, r * 0.45, 0, r * 0.6); g.quadraticCurveTo(-r * 0.2, r * 0.45, -r * 0.38, r * 0.15);
+    g.lineTo(-r * 0.45, -r * 0.35); g.closePath(); g.fill();
+  } else if (k === 'double') {
+    g.font = `700 ${Math.round(r * 0.85)}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('2×', 0, r * 0.05);
+  } else if (k === 'wide') {
+    g.moveTo(-r * 0.55, 0); g.lineTo(r * 0.55, 0);
+    g.moveTo(-r * 0.3, -r * 0.25); g.lineTo(-r * 0.55, 0); g.lineTo(-r * 0.3, r * 0.25);
+    g.moveTo(r * 0.3, -r * 0.25); g.lineTo(r * 0.55, 0); g.lineTo(r * 0.3, r * 0.25); g.stroke();
+  } else if (k === 'heart') {
+    heart(0, -r * 0.45, r * 0.95); g.fill();
+  } else if (k === 'rocket') {
+    g.moveTo(0, -r * 0.62); g.quadraticCurveTo(r * 0.34, -r * 0.2, r * 0.2, r * 0.3); g.lineTo(-r * 0.2, r * 0.3);
+    g.quadraticCurveTo(-r * 0.34, -r * 0.2, 0, -r * 0.62); g.fill();
+    g.beginPath(); g.moveTo(-r * 0.18, r * 0.05); g.lineTo(-r * 0.42, r * 0.45); g.lineTo(-r * 0.12, r * 0.3);
+    g.moveTo(r * 0.18, r * 0.05); g.lineTo(r * 0.42, r * 0.45); g.lineTo(r * 0.12, r * 0.3); g.fill();
+  }
+}
+function drawToken(p, t) {
+  const P = POWERS[p.power], q = proj(px(p), wy(p));
+  const r = BP * 0.14 * q.s, x = q.x, y = q.y - BP * 0.6 * q.s + Math.sin(t * 3 + p.x * 9) * 5;
+  const spin = Math.cos(t * 2.6 + p.x * 5), sx = Math.max(0.15, Math.abs(spin));
+  g.save(); g.translate(x, y);
+  castShadow(q.s * 0.8); // coin edge, offset for thickness
+  g.fillStyle = shade(P.col, -0.4);
+  g.beginPath(); g.ellipse(spin > 0 ? r * 0.12 : -r * 0.12, 0, r * sx + r * 0.1, r, 0, 0, TAU); g.fill();
+  noShadow();
+  g.beginPath(); g.ellipse(0, 0, r * sx, r, 0, 0, TAU); clayFill(0, 0, r, P.col);
+  g.scale(sx, 1); drawIcon(p.power, r);
+  g.restore();
+}
+
+// ---------------- world drawing ----------------
+// rolling clay hills: ridge points smoothed into curves, lit from above
+function drawRidge(arr, drift, hor, col) {
+  const n = arr.length, seg = W / 12, period = n * seg;
+  const off = -((drift % period) + period) % period;
+  const pts = [];
+  for (let k = 0; off + k * seg <= W + seg * 2; k++) pts.push([off + k * seg, hor - arr[k % n] * H]);
+  g.beginPath(); g.moveTo(pts[0][0], hor + 2); g.lineTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length - 1; i++)
+    g.quadraticCurveTo(pts[i][0], pts[i][1], (pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2);
+  g.lineTo(pts[pts.length - 1][0], hor + 2); g.closePath();
+  const gr = g.createLinearGradient(0, hor - H * 0.2, 0, hor);
+  gr.addColorStop(0, shade(col, 0.25)); gr.addColorStop(1, shade(col, -0.2));
+  castShadow(0.8); g.fillStyle = gr; g.fill(); noShadow();
+  clayPat.setTransform(new DOMMatrix([1, 0, 0, 1, off, 0]));
+  g.fillStyle = clayPat; g.fill();
+}
+// wrap a parallax layer position into [-margin, span - margin)
+const wrap = (v, span, margin) => ((v + margin) % span + span) % span - margin;
+// t here is stop-motion time, so everything on the backdrop moves in little steps
+// the current world's colours, fading over from the last world for a couple of seconds
+function palette(rt) {
+  const k = clamp((rt - worldT0) / 2.5, 0, 1), a = WORLDS[worldFrom], b = WORLDS[shownWorld];
+  const m = (x, y) => k >= 1 ? y : mixHex(x, y, k);
+  return { sky: a.sky.map((c, i) => m(c, b.sky[i])), ground: a.ground.map((c, i) => m(c, b.ground[i])),
+    far: m(a.far, b.far), near: m(a.near, b.near), sun: m(a.sun, b.sun) };
+}
+function drawBackground(t, pulse, P) {
+  // the ground sinks away below as you climb toward a dusky sky
+  const climb = camY0 - camY, hor = H * 0.86 + climb * 0.35, k = clamp(climb / (H * 5), 0, 1);
+  const sg = g.createLinearGradient(0, 0, 0, H);
+  sg.addColorStop(0, mix(P.sky[0], P.sky[2], k)); sg.addColorStop(1, mix(P.sky[1], P.sky[3], k));
+  g.fillStyle = sg; g.fillRect(0, 0, W, H);
+  // clay stars come out once you are high up
+  const sa = clamp(climb / H - 1, 0, 1);
+  if (sa > 0) {
+    g.globalAlpha = sa; g.lineJoin = 'round'; g.strokeStyle = GOLD;
+    for (const s of stars) {
+      const y = wrap(s.y * H * 1.3 + climb * 0.05, H * 1.3, 20), x = s.x * W;
+      const r = BP * 0.07 * s.s * (1 + 0.15 * Math.sin(t * 2 + s.p));
+      g.beginPath();
+      for (let i = 0; i < 10; i++) {
+        const a = -Math.PI / 2 + i * Math.PI / 5, rad = i % 2 ? r * 0.5 : r;
+        g.lineTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad);
+      }
+      g.closePath(); g.lineWidth = r * 0.35; g.stroke();
+      clayFill(x, y, r, GOLD);
+    }
+    g.globalAlpha = 1;
+  }
+  // sun
+  if (hor - sunR * 2 < H) {
+    const sr = sunR * (1 + pulse * 0.035), cx = W * 0.62, cy = hor - sunR * 0.55;
+    castShadow(1.5); blob(cx, cy, sr, sr, 99, 0.02); clayFill(cx, cy, sr, P.sun);
+  }
+  // clouds
+  for (const c of clouds) {
+    const sz = BP * 0.55 * c.s;
+    const y = wrap(c.y * H * 2.4 + climb * c.d, H * 2.4, H * 0.4), x = wrap(c.x * W * 1.6 + t * 10 * c.d, W * 1.6, W * 0.3);
+    if (y < -sz * 2 || y > H + sz) continue;
+    g.beginPath();
+    for (const p of c.puffs) { const r = p.r * sz; g.moveTo(x + p.x * sz + r, y + p.y * sz); g.arc(x + p.x * sz, y + p.y * sz, r, 0, TAU); }
+    castShadow(c.d * 2); clayFill(x - sz * 0.3, y - sz * 0.3, sz * 1.4, '#fbf3e8');
+  }
+  // floating music notes (mid-depth)
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (const f of floaters) {
+    const y = wrap(f.y * H * 1.4 + climb * 0.45, H * 1.4, 40);
+    const x = f.x * W + Math.sin(t * 0.8 + f.p) * 14;
+    g.globalAlpha = 0.6 + pulse * 0.3;
+    clayText(f.ch, x, y, Math.round(BP * 0.24 * f.s * (1 + pulse * 0.12)), f.col);
+  }
+  g.globalAlpha = 1;
+  if (hor - H * 0.25 > H) return;
+  // hills drift slowly sideways
+  drawRidge(ridgeFar, t * 6, hor, P.far);
+  drawRidge(ridgeNear, t * 14, hor, P.near);
+  if (hor >= H) return;
+  // ground with clay flowers that bounce on the beat
+  const fg = g.createLinearGradient(0, hor, 0, H);
+  fg.addColorStop(0, P.ground[0]); fg.addColorStop(1, P.ground[1]);
+  g.fillStyle = fg; g.fillRect(0, hor, W, H - hor);
+  clayPat.setTransform(new DOMMatrix([1, 0, 0, 1, 0, hor]));
+  g.fillStyle = clayPat; g.fillRect(0, hor, W, H - hor);
+  g.lineCap = 'round';
+  for (let i = 0; i < 7; i++) {
+    const fx0 = (i + 0.5) / 7 * W + Math.sin(i * 3.7) * 18, fy = hor + (H - hor) * 0.3 + (i % 2) * 10;
+    const h = BP * 0.12 * (1 + pulse * 0.25), r = BP * 0.05;
+    g.strokeStyle = '#3f6638'; g.lineWidth = 3; g.beginPath(); g.moveTo(fx0, fy); g.lineTo(fx0, fy - h); g.stroke();
+    blob(fx0, fy - h, r, r, i * 5, 0.08); clayFill(fx0, fy - h, r, [PINK, GOLD, CREAM][i % 3]);
+  }
+}
+function approachTime() { return Math.max(0.75, 2 * 60 / curBpm()); }
+// a squashed clay disc: the top shape stacked downward in a darker tone makes its thick side
+function drawPad(p, t, pulse, isT) {
+  const q = proj(px(p), wy(p));
+  if (q.y < -BP || q.y > H + BP) return;
+  if (p.glitch && Math.random() < 0.18) q.x += (Math.random() - 0.5) * 12; // decoys twitch
+  let col = p.off ? PINK : TEAL;
+  if (p.state === 1) col = p.grade === 'PERFECT' ? GOLD : MINT;
+  if (p.state === 2) col = RED;
+  const pop = clamp(1 - (t - p.hitT) * 4, 0, 1);
+  const big = (pw.wide && p.state === 0 ? 1.45 : 1) * (p.shrink && p.state === 0 ? 0.65 : 1);
+  const rx = BP * 0.26 * q.s * big * (1 + pop * 0.25 + (isT ? pulse * 0.06 : 0));
+  const ry = rx * tiltAt(q.y), th = BP * 0.1 * q.s, x = q.x, y = q.y;
+  let dim = p.state === 2 ? 0.45 : 1;
+  if (clock < blackoutUntil) dim *= 0.12;
+  if (p.glitch) dim *= 0.75 + Math.random() * 0.25;
+  // invader zap: a burst ring in their colour where the remix landed
+  const zap = inv && p.fxT ? (t - p.fxT) / 0.5 : 1;
+  if (zap < 1) {
+    g.strokeStyle = inv.who.col; g.lineWidth = 4 * (1 - zap); g.globalAlpha = 1 - zap;
+    g.beginPath(); g.ellipse(x, y, rx * (1 + zap * 1.5), ry * (1 + zap * 1.5), 0, 0, TAU); g.stroke();
+    g.globalAlpha = 1;
+  }
+  const seed = (p.step || 0) * 3.1 + p.x * 17, side = shade(col, -0.35);
+  g.globalAlpha = dim;
+  castShadow(q.s); blob(x, y + th, rx, ry, seed); g.fillStyle = side; g.fill(); noShadow();
+  g.fillStyle = side;
+  for (let k = th - 2; k > 0; k -= 2) { blob(x, y + k, rx, ry, seed); g.fill(); }
+  blob(x, y, rx, ry, seed); clayFill(x, y, rx, col);
+  // a groove pressed in with a thumb
+  g.lineWidth = Math.max(1.5, rx * 0.06);
+  g.globalAlpha = dim * 0.8;
+  g.strokeStyle = shade(col, -0.3); g.beginPath(); g.ellipse(x, y, rx * 0.6, ry * 0.6, 0, 0, TAU); g.stroke();
+  g.strokeStyle = shade(col, 0.45); g.beginPath(); g.ellipse(x, y + 1.5, rx * 0.6, ry * 0.6, 0, Math.PI * 0.15, Math.PI * 0.85); g.stroke();
+  g.globalAlpha = 1;
+}
+function drawPlatforms(t, pulse, pos) {
+  const target = plats[cur + 1];
+  for (const p of plats) {
+    drawPad(p, t, pulse, p === target && state === 'play');
+    if (p.decoy && p.state === 0) drawPad(p.decoy, t, pulse, p === target && state === 'play');
+  }
+  // dude's shadow on the pad he stands on / is landing on
+  if (!dude.dead) {
+    const sq = proj(px(dude.to), platTop(dude.to)), R = BP * 0.16 * sq.s * (pos.air ? 0.6 : 1);
+    g.fillStyle = `rgba(75,40,25,${pos.air ? 0.2 : 0.32})`;
+    g.beginPath(); g.ellipse(sq.x, sq.y, R * 1.1, R * 1.1 * tiltAt(sq.y), 0, 0, TAU); g.fill();
+  }
+  for (const p of plats) if (p.power && p.state === 0) drawToken(p, t);
+  // approach rings: rolled clay snakes lying flat on the pad, closing onto it exactly on the beat
+  if (state !== 'play') return;
+  const A = approachTime();
+  g.lineCap = 'round';
+  for (let i = cur + 1; i < plats.length; i++) {
+    const p = plats[i];
+    if (p.state !== 0) continue;
+    const d = p.time - t;
+    if (d > A) break;
+    const Ap = p.rush ? A * 0.45 : A; // rushed rings appear late and close fast
+    if (d > Ap) continue;
+    const f = clamp(d / Ap, 0, 1), isT = i === cur + 1;
+    const col = p.off ? PINK : TEAL, lw = isT ? 6 : 3;
+    for (const pad of p.decoy ? [p, p.decoy] : [p]) {
+      const q = proj(px(pad), wy(pad)), squash = clamp(tiltAt(q.y) * 1.7, 0.3, 0.6);
+      const base = BP * 0.27 * q.s * (pw.wide ? 1.45 : 1) * (p.shrink ? 0.65 : 1), r = base + f * BP * 0.95 * q.s;
+      g.globalAlpha = (isT ? 1 : 0.45) * (1 - f * 0.5);
+      g.lineWidth = lw;
+      g.strokeStyle = shade(col, -0.4); g.beginPath(); g.ellipse(q.x, q.y + lw * 0.45, r, r * squash, 0, 0, TAU); g.stroke();
+      g.strokeStyle = col; g.beginPath(); g.ellipse(q.x, q.y, r, r * squash, 0, 0, TAU); g.stroke();
+      if (isT) {
+        g.lineWidth = 1.5; g.strokeStyle = shade(col, 0.55);
+        g.beginPath(); g.ellipse(q.x, q.y - lw * 0.2, r, r * squash, 0, Math.PI * 1.1, Math.PI * 1.45); g.stroke();
+      }
+      g.globalAlpha *= 0.5; g.lineWidth = 2.5; g.setLineDash([0.1, 7]); g.strokeStyle = INK;
+      g.beginPath(); g.ellipse(q.x, q.y, base, base * squash, 0, 0, TAU); g.stroke(); g.setLineDash([]);
+      g.globalAlpha = 1;
+    }
+  }
+}
+
+// ---------------- invader booth ----------------
+function boothPos(rt) {
+  const BS = clamp(W * 0.34, 115, 175);
+  const ease = k => 1 - Math.pow(1 - clamp(k, 0, 1), 3);
+  let off = (1 - ease((rt - inv.inT) / 0.6)) * (BS + 40);
+  if (inv.outT) off += ease((rt - inv.outT) / 0.7) * (BS + 40);
+  return { BS, x: W - BS * 0.62 - 8 + off, y: H - BS * 0.32 - 12 };
+}
+function drawBooth(rt, pulse) {
+  if (!inv) return;
+  if (inv.outT && rt - inv.outT > 0.8) { inv = null; return; }
+  const { BS, x, y } = boothPos(rt), col = inv.who.col;
+  const headY = y - BS * 0.42 - pulse * 5, R = BS * 0.2;
+  // zap beam from the DJ to the pad they just remixed: a flung strand of clay
+  if (inv.beam) {
+    const a = (rt - inv.beam.t0) / 0.45;
+    if (a >= 1 || inv.beam.p.state !== 0) inv.beam = null;
+    else {
+      const q = proj(px(inv.beam.p), wy(inv.beam.p)), lw = 6 * (1 - a) + 1;
+      g.globalAlpha = 1 - a; g.lineCap = 'round'; g.lineWidth = lw;
+      for (const [c, o] of [[shade(col, -0.4), lw * 0.5], [col, 0]]) {
+        g.strokeStyle = c; g.beginPath(); g.moveTo(x - R * 0.6, headY + o);
+        g.quadraticCurveTo((x + q.x) / 2 - 60, (headY + q.y) / 2 + o, q.x, q.y + o); g.stroke();
+      }
+      g.globalAlpha = 1;
+    }
+  }
+  // the DJ: a rival clay blob with shades, bobbing behind the decks
+  drawDJHead(x, headY, R, col, inv.lost, inv.who.boss, rt);
+  // the decks: a clay box with a top face, turntables and an equalizer on the front
+  const w = BS, th = BS * 0.12, x0 = x - w / 2, y0 = y - BS * 0.2;
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(x0 + w, y0); g.lineTo(x0 + w - w * 0.06, y0 - th); g.lineTo(x0 + w * 0.06, y0 - th); g.closePath();
+  clayFill(x, y0 - th, w * 0.5, '#9a6a52');
+  for (const tx of [0.27, 0.73]) {
+    const cx = x0 + w * tx, cy = y0 - th / 2;
+    g.fillStyle = '#2b1d19'; g.beginPath(); g.ellipse(cx, cy, w * 0.17, th * 0.42, 0, 0, TAU); g.fill();
+    g.strokeStyle = col; g.lineWidth = 1.5; g.stroke();
+    const a = rt * 6 + tx * 9;
+    g.strokeStyle = CREAM; g.beginPath(); g.moveTo(cx, cy);
+    g.lineTo(cx + Math.cos(a) * w * 0.15, cy + Math.sin(a) * th * 0.36); g.stroke();
+  }
+  castShadow(1); rr(x0, y0, w, BS * 0.4, 6); clayFill(x, y0 + BS * 0.1, w * 0.6, '#6e4636');
+  for (let i = 0; i < 8; i++) {
+    const hgt = BS * 0.24 * (0.25 + 0.75 * Math.abs(Math.sin(rt * (3 + i) + i)) * (0.5 + pulse * 0.5));
+    g.fillStyle = i % 2 ? col : CREAM;
+    rr(x0 + w * 0.1 + i * w * 0.1, y0 + BS * 0.33 - hgt, w * 0.06, hgt, w * 0.03); g.fill();
+  }
+  // speech bubble
+  if (inv.say) {
+    const a = (rt - inv.say.t0) / 1.6;
+    if (a >= 1) inv.say = null;
+    else {
+      g.globalAlpha = clamp(Math.min(a * 8, (1 - a) * 4), 0, 1);
+      g.font = `600 ${Math.round(clamp(W * 0.034, 12, 16))}px ${FONT}`;
+      const tw = g.measureText(inv.say.text).width + 22, bx = Math.max(8, Math.min(x - tw + R, W - tw - 8)), by = headY - R - 44;
+      castShadow(0.5); rr(bx, by, tw, 30, 14); g.fillStyle = CREAM; g.fill(); noShadow();
+      g.strokeStyle = col; g.lineWidth = 2.5; g.stroke();
+      g.fillStyle = INK; g.textAlign = 'left'; g.textBaseline = 'middle';
+      g.fillText(inv.say.text, bx + 11, by + 15);
+      g.globalAlpha = 1;
+    }
+  }
+}
+
+// ---------------- HUD & screens ----------------
+function drawHUD(rt, pulse) {
+  const pad = 16, top = Math.max(16, H * 0.025);
+  g.textBaseline = 'top'; g.textAlign = 'left';
+  clayText(String(score), pad, top, Math.round(clamp(W * 0.08, 26, 44)), CREAM);
+  const mult = Math.min(8, 1 + Math.floor(combo / 8));
+  if (combo > 1) {
+    g.font = `700 ${Math.round(clamp(W * 0.035, 12, 18))}px ${FONT}`;
+    g.fillStyle = mult > 1 ? shade(GOLD, -0.4) : shade(TEAL, -0.35);
+    g.fillText(`${combo} COMBO  ×${mult}`, pad, top + clamp(W * 0.08, 26, 44) + 8);
+  }
+  // altitude
+  const alt = Math.round((plats[cur] ? plats[cur].v : 0) * 3);
+  g.font = `600 ${Math.round(clamp(W * 0.032, 11, 16))}px ${FONT}`;
+  g.fillStyle = 'rgba(75,50,43,0.75)';
+  g.fillText(`▲ ${alt} m`, pad, top + clamp(W * 0.08, 26, 44) + 30);
+  if (ghost) {
+    const gs = ghostScore(now());
+    g.fillStyle = gs > score ? shade(PINK, -0.3) : shade(MINT, -0.4);
+    g.fillText(`👻 ${gs}${gs > score ? '' : '  ✓'}`, pad, top + clamp(W * 0.08, 26, 44) + 50);
+  }
+  // which run this is
+  const tag = dailyNo ? `DAILY #${dailyNo}` : mode === 'challenge' ? (friendDJ ? 'INVASION' : 'GHOST RACE') : '';
+  if (tag) {
+    g.font = `700 12px ${FONT}`; g.textAlign = 'center'; g.fillStyle = 'rgba(75,50,43,0.7)';
+    g.fillText(tag, W / 2, top);
+    g.textAlign = 'left';
+  }
+  // hearts
+  const hs = clamp(W * 0.055, 18, 26);
+  for (let i = 0; i < 3; i++) {
+    const x = W - pad - hs * 0.5 - i * hs * 1.25;
+    heart(x, top + 4, hs);
+    if (i < lives) { castShadow(0.4); clayFill(x, top + 4 + hs * 0.45, hs * 0.6, PINK); }
+    else { g.strokeStyle = 'rgba(75,50,43,0.35)'; g.lineWidth = 2; g.stroke(); }
+  }
+  // bpm pill
+  const bt = `${Math.round(curBpm())} BPM`;
+  g.font = `600 13px ${FONT}`; g.textAlign = 'center';
+  const tw = g.measureText(bt).width + 34, bx = W / 2 - tw / 2, by = top + hs + 14;
+  rr(bx, by, tw, 24, 12); g.fillStyle = 'rgba(255,246,232,0.85)'; g.fill();
+  g.strokeStyle = 'rgba(75,50,43,0.3)'; g.lineWidth = 1.5; g.stroke();
+  g.fillStyle = TEAL; g.beginPath(); g.arc(bx + 13, by + 12, 3 + pulse * 2.5, 0, TAU); g.fill();
+  g.fillStyle = INK; g.fillText(bt, W / 2 + 7, by + 5);
+  // active power-ups
+  const act = Object.keys(pw).filter(k => pw[k] > 0);
+  let ax = W / 2 - act.length * 30;
+  for (const k of act) {
+    const cx = ax + 18, cy = by + 46;
+    g.save(); g.translate(cx, cy);
+    castShadow(0.4); g.beginPath(); g.arc(0, 0, 12, 0, TAU); clayFill(0, 0, 12, POWERS[k].col);
+    drawIcon(k, 12);
+    g.restore();
+    if (k !== 'shield') {
+      g.font = `700 13px ${FONT}`; g.fillStyle = INK; g.textAlign = 'left'; g.textBaseline = 'middle';
+      g.fillText(String(pw[k]), cx + 16, cy + 1);
+    }
+    ax += 60;
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  // invasion status
+  if (inv && inv.phase !== 'leave') {
+    const iy = by + (act.length ? 70 : 36), bw = Math.min(180, W * 0.5);
+    g.font = `700 13px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillStyle = shade(inv.who.col, -0.2);
+    const warn = inv.phase === 'warn';
+    if (!warn || Math.sin(rt * 14) > 0) g.fillText(`⚠ ${inv.who.name}${warn ? ' INCOMING' : ''}`, W / 2, iy);
+    if (!warn) {
+      rr(W / 2 - bw / 2, iy + 12, bw, 8, 4); g.fillStyle = 'rgba(75,50,43,0.2)'; g.fill();
+      rr(W / 2 - bw / 2, iy + 12, bw * (1 - inv.count / inv.len), 8, 4); g.fillStyle = inv.who.col; g.fill();
+      g.font = `600 11px ${FONT}`; g.fillStyle = INK;
+      g.fillText(`SURVIVE ${inv.len - inv.count}${inv.stolen ? `  ·  stolen ${inv.stolen}` : ''}`, W / 2, iy + 32);
+    }
+  }
+  // banner
+  if (banner) {
+    const a = rt - banner.t0;
+    if (a > 1.6) banner = null;
+    else {
+      g.globalAlpha = clamp(Math.min(a * 5, (1.6 - a) * 3), 0, 1);
+      g.textBaseline = 'middle';
+      const s = 1 + Math.max(0, 0.3 - a) * 1.5;
+      clayText(banner.text, W / 2, H * 0.2, Math.round(clamp(W * 0.09, 28, 54) * s), banner.col || GOLD);
+      if (banner.sub) clayText(banner.sub, W / 2, H * 0.2 + clamp(W * 0.08, 28, 48), Math.round(clamp(W * 0.045, 14, 24)), TEAL, 600);
+      g.globalAlpha = 1;
+    }
+  }
+  // count-in before the first pad
+  const first = plats[1];
+  if (cur === 0 && first && first.state === 0) {
+    const t = now(), beats = Math.ceil((first.time - t) / (60 / curBpm()));
+    g.textBaseline = 'middle';
+    clayText('GET READY', W / 2, H * 0.2, Math.round(clamp(W * 0.07, 24, 40)), TEAL);
+    if (beats >= 1 && beats <= 4) clayText(String(beats), W / 2, H * 0.2 + clamp(W * 0.1, 36, 60), Math.round(clamp(W * 0.1, 34, 60)), PINK);
+  }
+  if (paused) {
+    g.fillStyle = 'rgba(75,50,43,0.45)'; g.fillRect(0, 0, W, H);
+    g.textBaseline = 'middle';
+    clayText('PAUSED', W / 2, H * 0.42, Math.round(clamp(W * 0.1, 30, 56)), TEAL);
+    clayText('tap to resume', W / 2, H * 0.42 + 50, 16, CREAM, 600);
+  }
+}
+function drawTitle(rt) {
+  uiT = { s: 1, ox: 0, oy: 0 };
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  const s = clamp(W * 0.13, 40, 100);
+  const wob = Math.sin(rt * 2) * 4;
+  g.font = `700 ${s}px ${FONT}`;
+  const wh = g.measureText('HOP').width, wb = g.measureText('BEAT').width, gap = s * 0.15;
+  const x0 = W / 2 - (wh + wb + gap) / 2;
+  clayText('HOP', x0 + wh / 2, H * 0.15 + wob, s, PINK);
+  clayText('BEAT', x0 + wh + gap + wb / 2, H * 0.15 - wob, s, TEAL);
+  const fs = Math.round(clamp(W * 0.036, 12, 18)), bw = Math.min(W - 32, 420), bx = W / 2 - bw / 2;
+  if (challenge) { // opened from a friend's link
+    const c = challenge;
+    const line = c.dj ? `⚠ ${c.dj.name} wants to invade your world!`
+      : c.ghost ? `👻 A friend scored ${c.gscore.toLocaleString('en-US')}${c.daily ? ` on Daily #${c.daily}` : ''}` : 'A friend sent you a run';
+    g.font = `700 ${fs}px ${FONT}`; g.fillStyle = c.dj ? shade(c.dj.col, -0.3) : INK;
+    g.fillText(line, W / 2, H * 0.245);
+    g.font = `600 ${fs}px ${FONT}`; g.fillStyle = INK;
+    g.fillText(c.dj ? `${c.dj.set.length} moves · survive the set` : 'same pads · race their ghost', W / 2, H * 0.245 + fs * 1.5);
+    const aw = Math.min(bw, 300);
+    button('accept', W / 2 - aw / 2, H * 0.245 + fs * 2.7, aw, 52, c.dj ? 'BRING IT ON' : 'RACE THE GHOST', c.dj ? c.dj.col : ORANGE);
+  } else {
+    g.font = `600 ${fs}px ${FONT}`; g.fillStyle = INK;
+    g.fillText('Tap the clay pad above you', W / 2, H * 0.24);
+    g.fillText('just as the ring closes on it', W / 2, H * 0.24 + fs * 1.6);
+    g.fillStyle = shade(ORANGE, -0.3);
+    g.fillText('On the beat = PERFECT', W / 2, H * 0.24 + fs * 3.4);
+    g.fillText('Climb as high as you can — it speeds up!', W / 2, H * 0.24 + fs * 5);
+  }
+  // daily: one seed for everyone today; the streak counts days in a row with a finished daily run
+  const day = today(), st = store.get('streak', { last: 0, n: 0 }), d = store.get('daily', {});
+  const dsub = st.last === day ? `🔥 ${st.n} · today ${d.day === day ? d.best : 0}`
+    : st.last === day - 1 ? `🔥 ${st.n} · keep it going!` : 'same pads for everyone';
+  const y1 = H * 0.785, h1 = 58, w1 = (bw - 10) / 2;
+  button('play', bx, y1, w1, h1, 'PLAY', PINK, best ? `best ${best}` : 'endless climb');
+  button('daily', bx + w1 + 10, y1, w1, h1, `DAILY #${day}`, TEAL, dsub);
+  const y2 = y1 + h1 + 10, h2 = 46, w2 = (bw - 20) / 3;
+  button('calib', bx, y2, w2, h2, 'TIMING', ORANGE, userOff ? fmtMs(userOff) : 'calibrate');
+  button('closet', bx + w2 + 10, y2, w2, h2, 'CLOSET', GOLD, `${unlockedIds().length}/${HATS.length + PHONES.length}`);
+  button('dj', bx + 2 * (w2 + 10), y2, w2, h2, 'INVADE', '#8a6ad6', 'a friend');
+}
+function drawOver(rt) {
+  const a = clamp((rt - overT - 0.5) * 3, 0, 1);
+  if (a <= 0) return;
+  uiT = { s: 1, ox: 0, oy: 0 };
+  g.globalAlpha = a;
+  g.fillStyle = 'rgba(75,50,43,0.4)'; g.fillRect(0, 0, W, H);
+  // what else this run has to say, one line each
+  const o = overInfo || { unlocked: [] }, extra = [];
+  if (killer) extra.push([`defeated by ${killer}`, RED]);
+  else if (friendDJ) extra.push([friendDJ.beaten ? `you survived ${friendDJ.name}'s set!` : `${friendDJ.name} never showed up`, shade(friendDJ.col, -0.2)]);
+  if (ghost) extra.push([`ghost ${ghost.score}  ·  ${o.ghostWin ? 'YOU WIN! 👻' : 'the ghost wins'}`, o.ghostWin ? shade(MINT, -0.4) : shade(PINK, -0.3)]);
+  if (o.streak) extra.push([`🔥 ${o.streak} day streak  ·  today's best ${o.dailyBest}`, shade(ORANGE, -0.3)]);
+  if (o.unlocked.length) extra.push([`UNLOCKED: ${o.unlocked.join(', ')}`, shade(GOLD, -0.35)]);
+  const pw = Math.min(W - 32, 380), ph = 284 + extra.length * 24, px = W / 2 - pw / 2, py = H / 2 - ph / 2 - 10;
+  // a slab of rolled-out clay
+  castShadow(2); rr(px, py, pw, ph, 26); clayFill(W / 2, py + ph * 0.4, pw * 0.75, '#fff0dc');
+  g.strokeStyle = PINK; g.lineWidth = 5; g.stroke();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  clayText(dailyNo ? `DAILY #${dailyNo}` : 'GAME OVER', W / 2, py + 44, Math.round(clamp(W * 0.08, 26, 38)), PINK);
+  clayText(String(score), W / 2, py + 108, Math.round(clamp(W * 0.13, 40, 64)), GOLD);
+  g.font = `700 15px ${FONT}`;
+  g.fillStyle = newBest ? shade(ORANGE, -0.3) : shade(TEAL, -0.35);
+  g.fillText(newBest ? '★ NEW BEST ★' : `BEST ${best}`, W / 2, py + 154);
+  g.font = `600 15px ${FONT}`; g.fillStyle = INK;
+  g.fillText(`▲ ${o.alt || 0} m  ·  max combo ${maxCombo}  ·  ${Math.round(curBpm())} BPM`, W / 2, py + 182);
+  extra.forEach(([text, col], k) => {
+    g.font = `700 14px ${FONT}`; g.fillStyle = col;
+    g.fillText(text, W / 2, py + 210 + k * 24, pw - 24);
+  });
+  if (rt - overT > 0.9) {
+    const by = py + ph - 66, bw = (pw - 40) / 3;
+    button('share', px + 12, by, bw + 16, 50, 'SHARE', GOLD);
+    button('again', px + 20 + bw + 16, by, bw - 8, 50, 'AGAIN', TEAL);
+    button('menu', px + 28 + 2 * bw + 8, by, bw - 8, 50, 'MENU', PINK);
+  }
+  g.globalAlpha = 1;
+}
+
+// ---------------- links: ghosts and friend invasions ----------------
+// A share link carries everything in its #hash: the seed, the daily number, the sharer's run as a
+// run-length string of p(erfect) g(ood) m(iss) per pad, and their score. A DJ link carries a name,
+// a colour and a set of move letters instead. No server: the link is the save file.
+const rle = s => s.replace(/(.)\1*/g, m => m[0] + (m.length > 1 ? m.length : ''));
+const unrle = s => s.replace(/([pgm])(\d*)/g, (_, c, n) => c.repeat(Math.min(+n || 1, 5000)));
+const CODE_MOVE = Object.fromEntries(Object.entries(MOVE_CODE).map(([k, v]) => [v, k]));
+const cleanName = s => (s || '').toUpperCase().replace(/[^A-Z0-9 .!?'-]/g, '').trim().slice(0, 14);
+function readLink() {
+  const q = new URLSearchParams(location.hash.slice(1));
+  if (q.has('dj')) {
+    const set = [...(q.get('m') || '')].map(c => CODE_MOVE[c]).filter(Boolean).slice(0, 8);
+    if (!set.length) return null;
+    const col = DJ_COLS[clamp(+q.get('c') || 0, 0, DJ_COLS.length - 1)];
+    return { dj: { name: cleanName(q.get('dj')) || 'A FRIEND', col, rgb: rgbOf(col).join(','), transpose: 2, set, friend: true,
+      taunts: ['this one’s for you', 'made this set myself', 'dance, friend!'] } };
+  }
+  if (q.has('s')) {
+    const c = { seed: (+q.get('s') || 0) >>> 0, daily: +q.get('d') || 0 };
+    const gl = unrle(q.get('g') || '');
+    if (/^[pgm]+$/.test(gl)) { c.ghost = gl; c.gscore = +q.get('sc') || 0; }
+    return c;
+  }
+  return null;
+}
+let challenge = readLink();
+addEventListener('hashchange', () => { challenge = readLink(); if (state !== 'play') toTitle(); });
+
+// ---------------- ghost ----------------
+// The ghost keeps your clock: it stands on the newest pad whose beat has passed, for as many pads
+// as its run lasted, then tumbles off. Its live score is its hit-by-hit score scaled to its final one.
+let ghost = null;
+function makeGhost(log, final) {
+  const cum = [0];
+  let c = 0, s = 0;
+  for (const ch of log) {
+    if (ch === 'm') c = 0;
+    else { c++; s += (ch === 'p' ? 100 : 50) * Math.min(8, 1 + Math.floor(c / 8)); }
+    cum.push(s);
+  }
+  return { log, cum, score: final || s };
+}
+function ghostPad(t) {
+  let p = null;
+  for (const q of plats) if (q.time != null && q.time <= t) p = q;
+  return p;
+}
+function ghostScore(t) {
+  const p = ghostPad(t), c = ghost.cum, end = c[c.length - 1];
+  return p && end ? Math.round(c[Math.min(p.i, ghost.log.length)] * ghost.score / end) : 0;
+}
+function drawGhost(t) {
+  if (!ghost) return;
+  const p = ghostPad(t);
+  if (!p) return;
+  const L = ghost.log.length, at = i => plats.find(q => q.i === i);
+  let x, y, rot = 0;
+  if (p.i > L) { // its run ended on pad L
+    const d0 = at(L), d1 = at(L + 1);
+    if (!d0 || !d1) return;
+    const d = t - d1.time;
+    if (d > 1.5) return;
+    x = px(d0) + d * 70; y = platTop(d0) - 380 * d + 1500 * d * d; rot = d * 6;
+  } else {
+    const prev = at(p.i - 1) || p, k = clamp((t - p.time) / 0.22, 0, 1);
+    x = lerp(px(prev), px(p), k);
+    y = lerp(platTop(prev), platTop(p), 1 - Math.pow(1 - k, 2)) - Math.sin(k * Math.PI) * BP * 0.35;
+  }
+  // it stands just beside you on the pad, so the two of you never hide each other
+  const q = proj(x, y), R = BP * 0.13 * q.s, gx = q.x + (px(p) > W / 2 ? -1 : 1) * R * 2.3;
+  const hurt = p.i <= L && p.i > 0 && ghost.log[p.i - 1] === 'm' && t - p.time < 0.45;
+  g.save(); g.translate(gx, q.y); g.rotate(rot);
+  g.globalAlpha = 0.5;
+  blob(0, -R * 1.1, R, R * 1.1, 13, 0.05); g.fillStyle = hurt ? '#ffd0d0' : '#fffaf0'; g.fill();
+  g.strokeStyle = 'rgba(75,50,43,0.5)'; g.lineWidth = 2; g.stroke();
+  g.fillStyle = INK;
+  for (const s of [-1, 1]) { g.beginPath(); g.ellipse(s * R * 0.32, -R * 1.2, R * 0.12, R * 0.2, 0, 0, TAU); g.fill(); }
+  g.restore();
+  g.font = `700 ${Math.round(clamp(R * 0.7, 10, 14))}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = 'rgba(75,50,43,0.6)'; g.fillText('GHOST', gx, q.y - R * 2.7);
+}
+
+// ---------------- sharing ----------------
+function shareLink() {
+  const q = new URLSearchParams({ s: seed });
+  if (dailyNo) q.set('d', dailyNo);
+  q.set('g', rle(runLog)); q.set('sc', score);
+  return location.href.split('#')[0] + '#' + q;
+}
+// a Wordle-style strip: the run cut into ten slices, gold = all perfect, green = clean, red = a miss
+function shareCard() {
+  const L = runLog.length, n = Math.min(10, L), cells = [];
+  for (let k = 0; k < n; k++) {
+    const seg = runLog.slice(Math.floor(k * L / n), Math.floor((k + 1) * L / n));
+    cells.push(seg.includes('m') ? '🟥' : /^p+$/.test(seg) ? '🟨' : '🟩');
+  }
+  const o = overInfo || { alt: 0, streak: 0 };
+  const lines = [dailyNo ? `Hopbeat Daily #${dailyNo}${o.streak > 1 ? ' 🔥' + o.streak : ''}` : 'Hopbeat',
+    cells.join(''), `${score.toLocaleString('en-US')} pts · ▲ ${o.alt} m · ${maxCombo}× combo`];
+  if (friendDJ) lines.push(friendDJ.beaten ? `Survived ${friendDJ.name}’s set 🎧` : `Taken out by ${friendDJ.name} 💀`);
+  if (ghost) lines.push(o.ghostWin ? 'Beat my friend’s ghost 👻' : 'Lost to the ghost 👻');
+  lines.push('Race my ghost: ' + shareLink());
+  return lines.join('\n');
+}
+function djLink() {
+  const q = new URLSearchParams({ dj: djName, c: djCol, m: djSet.map(k => MOVE_CODE[k]).join('') });
+  return location.href.split('#')[0] + '#' + q;
+}
+const djText = () => `🎧 ${djName} is invading your Hopbeat! Survive my set: ${djLink()}`;
+// phones get the share sheet; everywhere else the text goes on the clipboard
+async function sendText(text, title) {
+  if (navigator.share && matchMedia('(pointer: coarse)').matches) {
+    try { await navigator.share({ title, text }); return; } catch (e) { if (e && e.name === 'AbortError') return; }
+  }
+  try { await navigator.clipboard.writeText(text); toastMsg('Copied! Paste it to a friend'); }
+  catch (e) { copyFallback(text); }
+}
+// older browsers and locked-down webviews: try the legacy copy, else leave the text selected in a box
+function copyFallback(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.readOnly = true;
+  ta.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(88vw,420px);height:170px;' +
+    `font:15px ${FONT};border:4px solid ${PINK};border-radius:18px;padding:12px;background:${CREAM};color:${INK};z-index:9`;
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  if (ok) { ta.remove(); toastMsg('Copied! Paste it to a friend'); return; }
+  toastMsg('Copy this, then tap outside the box');
+  const close = e => { if (e.target !== ta) { ta.remove(); removeEventListener('pointerdown', close, true); } };
+  setTimeout(() => addEventListener('pointerdown', close, true), 0);
+}
+let toast = null;
+const toastMsg = text => { toast = { text, t0: performance.now() / 1000 }; };
+function drawToast(rt) {
+  if (!toast) return;
+  const a = rt - toast.t0;
+  if (a > 2.2) { toast = null; return; }
+  g.globalAlpha = clamp(Math.min(a * 6, (2.2 - a) * 3), 0, 1);
+  g.font = `600 15px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  const tw = g.measureText(toast.text).width + 32, y = H - 60;
+  castShadow(0.6); rr(W / 2 - tw / 2, y - 20, tw, 40, 20); g.fillStyle = INK; g.fill(); noShadow();
+  g.fillStyle = CREAM; g.fillText(toast.text, W / 2, y + 1);
+  g.globalAlpha = 1;
+}
+
+// ---------------- buttons ----------------
+// Menus are drawn into a 400×620 box scaled to fit the screen; each button registers its on-screen
+// rectangle for the next tap.
+let btns = [], uiT = { s: 1, ox: 0, oy: 0 };
+function menuT() {
+  const s = Math.min(W / 400, H / 620, 1.6);
+  return { s, ox: (W - 400 * s) / 2, oy: (H - 620 * s) / 2 };
+}
+function button(id, x, y, w, h, label, col, sub, off) {
+  const { s, ox, oy } = uiT;
+  btns.push({ id, x: ox + x * s, y: oy + y * s, w: w * s, h: h * s, off });
+  g.save();
+  if (off) g.globalAlpha *= 0.45;
+  castShadow(0.6); rr(x, y, w, h, Math.min(18, h / 2)); clayFill(x + w / 2, y + h / 2, Math.max(w, h) * 0.6, col);
+  g.strokeStyle = shade(col, -0.35); g.lineWidth = 2; g.stroke();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  const fs = Math.round(Math.min(h * 0.4, 22));
+  if (sub) {
+    clayText(label, x + w / 2, y + h * 0.37, fs, CREAM);
+    g.font = `600 ${Math.round(fs * 0.6)}px ${FONT}`; g.fillStyle = shade(col, -0.6);
+    g.fillText(sub, x + w / 2, y + h * 0.75);
+  } else clayText(label, x + w / 2, y + h / 2, fs, CREAM);
+  g.restore();
+}
+function press(id) {
+  const [k, v] = id.split(':');
+  if (k === 'play') startGame('endless');
+  else if (k === 'daily') startGame('daily');
+  else if (k === 'accept') startGame('challenge');
+  else if (k === 'again') startGame(mode);
+  else if (k === 'menu') toTitle();
+  else if (k === 'share') sendText(shareCard(), 'Hopbeat');
+  else if (k === 'calib') openCalib();
+  else if (k === 'csave') { userOff = calibOffset(); store.set('offset', userOff); toastMsg('Timing saved: ' + fmtMs(userOff)); toTitle(); }
+  else if (k === 'creset') { userOff = 0; store.set('offset', 0); calib.taps = []; toastMsg('Timing reset'); }
+  else if (k === 'closet') state = 'closet';
+  else if (k === 'hat' || k === 'ph') {
+    const it = itemById(k === 'hat' ? v : 'ph' + v);
+    if (!it.ok(stats)) { toastMsg('🔒 ' + it.req); return; }
+    if (k === 'hat') look.hat = v; else look.phones = +v;
+    store.set('look', look);
+  }
+  else if (k === 'dj') state = 'dj';
+  else if (k === 'djm') {
+    if (djSet.length >= 6) { toastMsg('A set holds 6 moves'); return; }
+    djSet.push(v); initAudio(); ac.resume(); scratch(ac.currentTime + 0.01);
+  }
+  else if (k === 'djx') djSet.splice(+v, 1);
+  else if (k === 'djc') { djCol = +v; store.set('djcol', djCol); }
+  else if (k === 'djn') {
+    let n = '';
+    try { n = cleanName(prompt('Your DJ name', djName)); } catch (e) { toastMsg('Renaming isn’t supported in this browser'); }
+    if (n) { djName = n; store.set('djname', djName); }
+  }
+  else if (k === 'djsend') sendText(djText(), 'Hopbeat invasion');
+  else if (k === 'back') toTitle();
+}
+function toTitle() {
+  state = 'title'; inv = null; ghost = null; friendDJ = null; keyShift = 0; blackoutUntil = 0; banner = null;
+  pw = { shield: 0, double: 0, wide: 0, rocket: 0 };
+  shownWorld = worldFrom = 0; worldT0 = -9;
+  setupTitle();
+}
+// the menus sit on a slab of rolled-out clay over the dimmed scene
+function menuSlab() {
+  g.fillStyle = 'rgba(75,50,43,0.4)'; g.fillRect(0, 0, W, H);
+  uiT = menuT();
+  g.save(); g.translate(uiT.ox, uiT.oy); g.scale(uiT.s, uiT.s);
+  castShadow(2); rr(12, 10, 376, 600, 26); clayFill(200, 250, 300, '#fff0dc');
+  g.strokeStyle = TEAL; g.lineWidth = 5; g.stroke();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+}
+function smallText(text, x, y, size, col, weight = 600) {
+  g.font = `${weight} ${size}px ${FONT}`; g.fillStyle = col; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text, x, y);
+}
+
+// ---------------- timing calibration ----------------
+// A click plays on every beat and you tap along. The median gap between your taps and the clicks is
+// how late your speakers, screen and fingers make you; the game's clock shifts by exactly that.
+const CAL_P = 0.6;
+let calib = null;
+const fmtMs = v => `${v >= 0 ? '+' : ''}${Math.round(v * 1000)} ms`;
+function openCalib() {
+  initAudio();
+  if (ac.state !== 'running') ac.resume();
+  calib = { start: ac.currentTime + 0.4, next: 0, taps: [], tapT: -9 };
+  state = 'calib';
+}
+function calibSched() {
+  if (!calib || !audioLive()) return;
+  for (;;) {
+    const t = calib.start + calib.next * CAL_P;
+    if (t > ac.currentTime + 0.15) break;
+    if (t > ac.currentTime) { kick(t, 0.8); blip(t, calib.next % 4 ? 81 : 88, 0.12); }
+    calib.next++;
+  }
+}
+const calibZone = () => menuT().oy + 470 * menuT().s;
+function calibTap() {
+  const raw = ac.currentTime - latency, n = Math.round((raw - calib.start) / CAL_P), d = raw - (calib.start + n * CAL_P);
+  calib.tapT = performance.now() / 1000;
+  if (n < 0 || Math.abs(d) > CAL_P * 0.45) return;
+  calib.taps.push(d);
+  if (calib.taps.length > 16) calib.taps.shift();
+}
+function calibOffset() {
+  const a = calib.taps.slice().sort((x, y) => x - y);
+  return a.length ? a[a.length >> 1] : userOff;
+}
+function drawCalib(rt) {
+  menuSlab();
+  clayText('TIMING', 200, 52, 36, TEAL);
+  smallText('Tap anywhere up here on every click.', 200, 92, 15, INK);
+  smallText('We measure how late your taps land.', 200, 113, 15, INK);
+  const ph = ac ? (ac.currentTime - latency - calib.start) / CAL_P : -1;
+  const pulse = ph >= 0 ? Math.exp(-(ph % 1) * CAL_P * 9) : 0, hitP = clamp(1 - (rt - calib.tapT) * 4, 0, 1);
+  const r = 66 * (1 + pulse * 0.12 + hitP * 0.05);
+  castShadow(1); blob(200, 236, r, r * 0.55, 5); g.fillStyle = shade(TEAL, -0.35); g.fill(); noShadow();
+  blob(200, 226, r, r * 0.55, 5); clayFill(200, 226, r, pulse > 0.5 ? GOLD : TEAL);
+  if (ph >= 0) clayText(String((Math.floor(ph) % 4) + 1), 200, 226, 34, CREAM);
+  // tap errors on a ±200 ms ruler, newest darkest
+  const bx = 40, bw = 320, by = 340, toX = v => bx + bw / 2 + clamp(v / 0.2, -1, 1) * bw / 2;
+  rr(bx, by - 5, bw, 10, 5); g.fillStyle = 'rgba(75,50,43,0.15)'; g.fill();
+  g.fillStyle = INK; g.fillRect(bx + bw / 2 - 1, by - 14, 2, 28);
+  smallText('early', bx + 24, by + 26, 12, 'rgba(75,50,43,0.6)');
+  smallText('late', bx + bw - 20, by + 26, 12, 'rgba(75,50,43,0.6)');
+  calib.taps.forEach((v, k) => {
+    g.globalAlpha = 0.3 + 0.7 * (k + 1) / calib.taps.length;
+    g.beginPath(); g.arc(toX(v), by, 6, 0, TAU); g.fillStyle = PINK; g.fill();
+  });
+  g.globalAlpha = 1;
+  const ready = calib.taps.length >= 6, off = calibOffset();
+  if (ready) {
+    g.beginPath(); g.moveTo(toX(off), by - 10); g.lineTo(toX(off) - 8, by - 24); g.lineTo(toX(off) + 8, by - 24); g.closePath();
+    g.fillStyle = GOLD; g.fill();
+    clayText(Math.abs(off) < 0.012 ? 'spot on!' : `you tap ${Math.round(Math.abs(off) * 1000)} ms ${off > 0 ? 'late' : 'early'}`, 200, 400, 24, PINK);
+  } else smallText(`tap along… ${calib.taps.length}/6`, 200, 400, 18, INK, 700);
+  smallText(`saved offset: ${fmtMs(userOff)}`, 200, 436, 14, 'rgba(75,50,43,0.7)');
+  button('csave', 24, 520, 122, 56, 'SAVE', TEAL, null, !ready);
+  button('creset', 152, 520, 100, 56, 'RESET', ORANGE);
+  button('back', 258, 520, 118, 56, 'BACK', PINK);
+  g.restore();
+}
+
+// ---------------- closet ----------------
+// looks are earned by milestones, checked against lifetime stats
+const HATS = [
+  { id: 'none', name: 'NO HAT', req: '', ok: () => true },
+  { id: 'cone', name: 'PARTY CONE', req: 'play 3 runs', ok: s => s.runs >= 3 },
+  { id: 'cap', name: 'DJ CAP', req: 'repel 3 invasions', ok: s => s.repelled >= 3 },
+  { id: 'crown', name: 'CROWN', req: 'score 10,000 in one run', ok: s => s.best >= 10000 },
+  { id: 'prop', name: 'PROPELLER', req: 'climb 150 m', ok: s => s.alt >= 150 },
+  { id: 'star', name: 'STAR ANTENNA', req: '3-day daily streak', ok: s => s.streakMax >= 3 },
+  { id: 'horns', name: 'BOSS HORNS', req: 'repel THE REMIXER', ok: s => s.boss >= 1 },
+];
+const PHONES = [
+  { col: TEAL, name: 'TEAL PHONES', req: '', ok: () => true },
+  { col: GOLD, name: 'GOLD PHONES', req: 'climb 50 m', ok: s => s.alt >= 50 },
+  { col: PINK, name: 'PINK PHONES', req: '200 perfects in total', ok: s => s.perfects >= 200 },
+  { col: '#8a6ad6', name: 'PURPLE PHONES', req: 'repel an invasion flawlessly', ok: s => s.flawless >= 1 },
+  { col: '#6e4636', name: 'COCOA PHONES', req: 'beat a friend’s ghost', ok: s => s.ghosts >= 1 },
+];
+const itemById = id => id.startsWith('ph') && id !== 'ph' ? PHONES[+id.slice(2)] : HATS.find(h => h.id === id);
+const unlockedIds = () => [...HATS.filter(h => h.ok(stats)).map(h => h.id),
+  ...PHONES.map((p, i) => p.ok(stats) ? 'ph' + i : null).filter(Boolean)];
+// hats sit on the dude's head; local coords with the head centred at (0, cy)
+function drawHat(id, R, cy, t) {
+  const top = cy - R * 0.92;
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  if (id === 'cone') {
+    g.beginPath(); g.moveTo(-R * 0.45, top + R * 0.15); g.lineTo(R * 0.12, top - R * 1.05); g.lineTo(R * 0.5, top + R * 0.15); g.closePath();
+    clayFill(0, top - R * 0.4, R * 0.8, GOLD);
+    for (const [dx, dy] of [[-0.12, -0.05], [0.2, -0.4], [0.02, -0.7]]) {
+      g.beginPath(); g.arc(R * dx, top + R * dy, R * 0.07, 0, TAU); g.fillStyle = PINK; g.fill();
+    }
+    g.beginPath(); g.arc(R * 0.12, top - R * 1.08, R * 0.17, 0, TAU); clayFill(R * 0.12, top - R * 1.08, R * 0.17, PINK);
+  } else if (id === 'cap') {
+    g.beginPath(); g.ellipse(R * 0.6, top + R * 0.14, R * 0.62, R * 0.14, 0.12, 0, TAU); clayFill(R * 0.6, top + R * 0.14, R * 0.6, '#b8322a');
+    g.beginPath(); g.ellipse(0, top + R * 0.16, R * 0.8, R * 0.62, 0, Math.PI, TAU); g.closePath(); clayFill(0, top - R * 0.2, R * 0.8, RED);
+    g.beginPath(); g.arc(0, top - R * 0.46, R * 0.1, 0, TAU); g.fillStyle = '#8f2620'; g.fill();
+  } else if (id === 'crown') {
+    const w = R * 0.62, b = top + R * 0.18, h = R * 0.66;
+    g.beginPath(); g.moveTo(-w, b); g.lineTo(-w, b - h * 0.6); g.lineTo(-w * 0.5, b - h * 0.25); g.lineTo(0, b - h);
+    g.lineTo(w * 0.5, b - h * 0.25); g.lineTo(w, b - h * 0.6); g.lineTo(w, b); g.closePath();
+    clayFill(0, b - h * 0.5, w, GOLD);
+    [PINK, TEAL, PINK].forEach((c, k) => { g.beginPath(); g.arc((k - 1) * w * 0.55, b - h * 0.2, R * 0.08, 0, TAU); g.fillStyle = c; g.fill(); });
+  } else if (id === 'prop') {
+    g.beginPath(); g.ellipse(0, top + R * 0.16, R * 0.62, R * 0.44, 0, Math.PI, TAU); g.closePath(); clayFill(0, top - R * 0.1, R * 0.6, TEAL);
+    g.strokeStyle = INK; g.lineWidth = R * 0.08;
+    g.beginPath(); g.moveTo(0, top - R * 0.26); g.lineTo(0, top - R * 0.6); g.stroke();
+    const s = Math.cos(t * 14);
+    g.beginPath(); g.ellipse(0, top - R * 0.64, R * 0.75 * Math.abs(s) + R * 0.08, R * 0.11, 0, 0, TAU);
+    clayFill(0, top - R * 0.64, R * 0.7, s > 0 ? ORANGE : GOLD);
+  } else if (id === 'star') {
+    g.strokeStyle = INK; g.lineWidth = R * 0.07;
+    g.beginPath(); g.moveTo(0, top + R * 0.05); g.quadraticCurveTo(R * 0.25, top - R * 0.4, R * 0.1, top - R * 0.85); g.stroke();
+    const sx = R * 0.1, sy = top - R * 1.05, r = R * 0.32 * (1 + 0.08 * Math.sin(t * 6));
+    g.beginPath();
+    for (let k = 0; k < 10; k++) { const a = -Math.PI / 2 + k * Math.PI / 5, rad = k % 2 ? r * 0.48 : r; g.lineTo(sx + Math.cos(a) * rad, sy + Math.sin(a) * rad); }
+    g.closePath(); clayFill(sx, sy, r, GOLD);
+  } else if (id === 'horns') {
+    for (const s of [-1, 1]) {
+      g.beginPath(); g.moveTo(s * R * 0.62, top + R * 0.4);
+      g.quadraticCurveTo(s * R * 1.1, top - R * 0.05, s * R * 0.9, top - R * 0.62);
+      g.quadraticCurveTo(s * R * 0.62, top - R * 0.02, s * R * 0.28, top + R * 0.2); g.closePath();
+      clayFill(s * R * 0.7, top, R * 0.5, '#f3ecd0');
+    }
+  }
+}
+function drawCloset(rt, pulse) {
+  menuSlab();
+  clayText('CLOSET', 200, 50, 36, PINK);
+  const hat = HATS.find(h => h.id === look.hat) || HATS[0];
+  drawDude(200, 230, rt, false, pulse, 0, 52 / (BP * 0.15));
+  smallText(`${hat.name}  ·  ${PHONES[look.phones].name}`, 200, 262, 15, INK, 700);
+  const cw = 86, ch = 70, x0 = 200 - (4 * cw + 3 * 6) / 2;
+  HATS.forEach((h, k) => {
+    const x = x0 + (k % 4) * (cw + 6), y = 282 + Math.floor(k / 4) * (ch + 6), ok = h.ok(stats);
+    btns.push({ id: 'hat:' + h.id, x: uiT.ox + x * uiT.s, y: uiT.oy + y * uiT.s, w: cw * uiT.s, h: ch * uiT.s });
+    rr(x, y, cw, ch, 14); g.fillStyle = h.id === look.hat ? 'rgba(246,181,58,0.35)' : 'rgba(75,50,43,0.08)'; g.fill();
+    g.strokeStyle = h.id === look.hat ? GOLD : 'rgba(75,50,43,0.25)'; g.lineWidth = h.id === look.hat ? 4 : 1.5; g.stroke();
+    g.save(); g.translate(x + cw / 2, y + ch * 0.68); if (!ok) g.globalAlpha = 0.3;
+    g.beginPath(); g.arc(0, 0, 15, 0, TAU); clayFill(0, 0, 15, DUDE);
+    if (h.id === 'none') smallText('—', 0, -26, 16, INK); else drawHat(h.id, 15, 0, rt);
+    g.restore();
+    if (!ok) smallText('🔒', x + cw - 16, y + 16, 14, INK);
+  });
+  smallText('HEADPHONES', 200, 448, 13, 'rgba(75,50,43,0.7)', 700);
+  PHONES.forEach((p, k) => {
+    const x = 200 + (k - 2) * 58, y = 484, ok = p.ok(stats);
+    btns.push({ id: 'ph:' + k, x: uiT.ox + (x - 24) * uiT.s, y: uiT.oy + (y - 24) * uiT.s, w: 48 * uiT.s, h: 48 * uiT.s });
+    g.save(); if (!ok) g.globalAlpha = 0.3;
+    castShadow(0.5); g.beginPath(); g.arc(x, y, 18, 0, TAU); clayFill(x, y, 18, p.col);
+    g.restore();
+    if (k === look.phones) { g.strokeStyle = GOLD; g.lineWidth = 4; g.beginPath(); g.arc(x, y, 23, 0, TAU); g.stroke(); }
+    if (!ok) smallText('🔒', x, y, 14, INK);
+  });
+  smallText('tap a locked one to see how to earn it', 200, 524, 13, 'rgba(75,50,43,0.6)');
+  button('back', 120, 546, 160, 50, 'BACK', PINK);
+  g.restore();
+}
+
+// ---------------- build a DJ set ----------------
+// you pick up to six remix moves; the link plays them against your friend, in order, on a loop
+let djSet = [], djCol = clamp(+store.get('djcol', 0) || 0, 0, DJ_COLS.length - 1), djName = cleanName(store.get('djname', '')) || 'DJ YOU';
+const MOVE_SHORT = { decoy: 'FAKE', drift: 'WOBBLE', rush: 'RUSH', shrink: 'SHRINK', blackout: 'DARK', double: '2×' };
+function drawDJHead(x, y, R, col, sad, boss, rt) {
+  castShadow(0.8); blob(x, y, R, R, 41, 0.035); clayFill(x, y, R, col);
+  g.strokeStyle = CREAM; g.lineWidth = R * 0.15; g.lineCap = 'round';
+  g.beginPath(); g.arc(x, y, R * 1.12, Math.PI * 1.12, Math.PI * 1.88); g.stroke();
+  g.fillStyle = '#2b1d19'; rr(x - R * 0.75, y - R * 0.32, R * 1.5, R * 0.42, R * 0.18); g.fill();
+  g.fillStyle = 'rgba(255,250,240,0.7)'; g.fillRect(x - R * 0.5, y - R * 0.24, R * 0.25, R * 0.06);
+  g.strokeStyle = INK; g.lineWidth = R * 0.1; g.beginPath();
+  if (sad) g.arc(x, y + R * 0.6, R * 0.25, Math.PI * 1.15, Math.PI * 1.85);
+  else g.arc(x, y + R * 0.2, R * 0.32, Math.PI * 0.1, Math.PI * 0.9);
+  g.stroke();
+  if (boss) { g.save(); g.translate(x, y); drawHat('horns', R, 0, rt); g.restore(); }
+}
+function drawDJ(rt, pulse) {
+  menuSlab();
+  const col = DJ_COLS[djCol];
+  clayText('INVADE A FRIEND', 200, 48, 30, col);
+  smallText('Build a set. Your friend gets a link,', 200, 84, 14, INK);
+  smallText('and your moves hit their tower in order.', 200, 103, 14, INK);
+  drawDJHead(200, 158 - pulse * 3, 30, col, false, false, rt);
+  button('djn', 100, 198, 200, 40, djName + '  ✎', col);
+  DJ_COLS.forEach((c, k) => {
+    const x = 200 + (k - 2) * 46, y = 264;
+    btns.push({ id: 'djc:' + k, x: uiT.ox + (x - 20) * uiT.s, y: uiT.oy + (y - 20) * uiT.s, w: 40 * uiT.s, h: 40 * uiT.s });
+    castShadow(0.4); g.beginPath(); g.arc(x, y, 14, 0, TAU); clayFill(x, y, 14, c);
+    if (k === djCol) { g.strokeStyle = INK; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 19, 0, TAU); g.stroke(); }
+  });
+  smallText('MOVES', 200, 302, 13, 'rgba(75,50,43,0.7)', 700);
+  Object.keys(MOVES).forEach((k, n) => {
+    const x = 21 + (n % 3) * 122, y = 316 + Math.floor(n / 3) * 54;
+    button('djm:' + k, x, y, 114, 46, MOVES[k].replace('!', ''), n % 2 ? PINK : TEAL);
+  });
+  smallText(`YOUR SET  ${djSet.length}/6  ·  tap one to remove it`, 200, 438, 13, 'rgba(75,50,43,0.7)', 700);
+  for (let n = 0; n < 6; n++) {
+    const x = 17 + n * 62, y = 454;
+    if (djSet[n]) button('djx:' + n, x, y, 56, 44, MOVE_SHORT[djSet[n]], col);
+    else {
+      rr(x, y, 56, 44, 14); g.setLineDash([4, 5]); g.strokeStyle = 'rgba(75,50,43,0.35)'; g.lineWidth = 2; g.stroke(); g.setLineDash([]);
+      smallText(String(n + 1), x + 28, y + 22, 14, 'rgba(75,50,43,0.35)', 700);
+    }
+  }
+  button('djsend', 26, 530, 214, 56, 'SEND SET', GOLD, 'copy invasion link', !djSet.length);
+  button('back', 250, 530, 124, 56, 'BACK', PINK);
+  g.restore();
+}
+
+// ---------------- main loop ----------------
+let lastRt = performance.now() / 1000, camT = lastRt;
+function beatPulse(t) {
+  if (!steps.length || inMenu()) return Math.exp(-((t % 0.6)) * 7);
+  let i = Math.min(schedIdx, steps.length - 1);
+  while (i > 0 && steps[i] > t) i--;
+  i -= i % 4;
+  return t < steps[i] ? 0 : Math.exp(-(t - steps[i]) * 7);
+}
+function frame() {
+  requestAnimationFrame(frame);
+  const rt = performance.now() / 1000;
+  const dtf = clamp(rt - lastRt, 0, 0.05); lastRt = rt;
+  if (ac && ac.state === 'running') latency = clamp((ac.outputLatency || 0) + (ac.baseLatency || 0), 0, 0.3);
+  const menu = inMenu(), t = menu ? rt : now();
+  clock = t;
+  if (state === 'play' && !paused) { scheduler(); update(t); }
+  const pulse = beatPulse(t);
+  boil = Math.floor(rt * 12);
+  btns = [];
+
+  // dude & camera
+  let pos, rot = 0;
+  if (dude.dead) {
+    const d = rt - dude.deadT;
+    pos = { x: dude.dx + dude.dvx * Math.min(d, 1.5), y: dude.dy - 380 * d + 1500 * d * d, air: true };
+    rot = d * 7;
+  } else {
+    pos = dudePos(t);
+    // frame-rate independent follow, so slow devices never leave the camera behind
+    camY += (platTop(dude.to) - H * 0.72 - camY) * (1 - Math.exp(-clamp(rt - camT, 0, 1) * 6));
+  }
+  camT = rt;
+  dude.squash *= Math.pow(0.0005, dtf);
+  if (pos.air && !dude.dead) trail.push({ x: pos.x, y: pos.y, a: 1 });
+
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.save();
+  if (shake > 0.2) { g.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake); shake *= Math.pow(0.002, dtf); }
+  drawBackground(boil / 12, pulse, palette(rt));
+  if (t < blackoutUntil) { g.fillStyle = 'rgba(30,18,12,0.82)'; g.fillRect(-20, -20, W + 40, H + 40); }
+  drawPlatforms(t, pulse, pos);
+  if (!menu) drawGhost(t);
+
+  // trail: a soft clay smear behind the jump
+  const trailCol = pw.rocket ? '242,138,58' : '255,143,177';
+  for (let i = trail.length - 1; i >= 0; i--) {
+    const p = trail[i]; p.a -= dtf * (pw.rocket ? 2.5 : 4);
+    if (p.a <= 0) { trail.splice(i, 1); continue; }
+    const q = proj(p.x, p.y);
+    g.fillStyle = `rgba(${trailCol},${p.a * 0.3})`;
+    g.beginPath(); g.arc(q.x, q.y - BP * 0.15 * q.s, BP * 0.13 * p.a * q.s, 0, TAU); g.fill();
+  }
+  const dq = proj(pos.x, pos.y);
+  drawDude(dq.x, dq.y, t, pos.air, pulse, rot, dq.s);
+
+  // particles: little clay crumbs
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= p.dec * dtf;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    p.vy += 900 * dtf; p.x += p.vx * dtf; p.y += p.vy * dtf; p.vx *= 0.985;
+    const q = proj(p.x, p.y);
+    g.globalAlpha = Math.min(1, p.life * 1.5); g.fillStyle = p.col;
+    g.beginPath(); g.arc(q.x, q.y, p.size * q.s * (0.5 + p.life * 0.5), 0, TAU); g.fill();
+  }
+  g.globalAlpha = 1;
+  // tap ripples
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const r = ripples[i], a = (rt - r.t0) / 0.35;
+    if (a >= 1) { ripples.splice(i, 1); continue; }
+    g.strokeStyle = `rgba(75,50,43,${0.5 * (1 - a)})`; g.lineWidth = 3;
+    g.beginPath(); g.arc(r.x, r.y, 8 + a * 34, 0, TAU); g.stroke();
+  }
+  // popups
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (let i = pops.length - 1; i >= 0; i--) {
+    const p = pops[i], a = (rt - p.t0) / 0.8;
+    if (a >= 1) { pops.splice(i, 1); continue; }
+    g.globalAlpha = 1 - a * a;
+    const s = Math.round(clamp(BP * 0.14, 15, 26) * (1 + Math.max(0, 0.15 - a) * 2));
+    const q = proj(p.x, p.y);
+    clayText(p.text, q.x, q.y - a * 40, s, p.col);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+
+  // screen overlays
+  if (flash > 0.01) { g.fillStyle = `rgba(${flashCol},${flash * 0.5})`; g.fillRect(0, 0, W, H); flash *= Math.pow(0.001, dtf); }
+  // film grain, re-rolled each stop-motion frame
+  grainPat.setTransform(new DOMMatrix([1, 0, 0, 1, hash(boil, 1) * 256, hash(boil, 2) * 256]));
+  g.globalAlpha = 0.55; g.fillStyle = grainPat; g.fillRect(0, 0, W, H); g.globalAlpha = 1;
+  g.fillStyle = vignette; g.fillRect(0, 0, W, H);
+  if (inv && inv.phase !== 'leave') { // invader's colour bleeds in from the screen edges
+    const k = inv.phase === 'warn' ? 0.25 + 0.25 * Math.abs(Math.sin(rt * 8)) : 0.12 + pulse * 0.12;
+    const eg = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.45, W / 2, H / 2, Math.max(W, H) * 0.72);
+    eg.addColorStop(0, `rgba(${inv.who.rgb},0)`); eg.addColorStop(1, `rgba(${inv.who.rgb},${k})`);
+    g.fillStyle = eg; g.fillRect(0, 0, W, H);
+  }
+  if (!menu) drawBooth(rt, pulse);
+  if (state === 'title') drawTitle(rt);
+  else if (state === 'calib') drawCalib(rt);
+  else if (state === 'closet') drawCloset(rt, pulse);
+  else if (state === 'dj') drawDJ(rt, pulse);
+  else { drawHUD(rt, pulse); if (state === 'over') drawOver(rt); }
+  drawToast(rt);
+}
+function inMenu() { return state === 'title' || state === 'calib' || state === 'closet' || state === 'dj'; }
+setupTitle();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
